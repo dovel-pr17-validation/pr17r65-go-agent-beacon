@@ -1,0 +1,204 @@
+package ci
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
+)
+
+func TestNormalizeUploadsSplitsAndDedupes(t *testing.T) {
+	got, err := normalizeUploads([]string{"s3,gcs", "s3"})
+	if err != nil {
+		t.Fatalf("normalizeUploads returned error: %v", err)
+	}
+	if want := []string{UploadS3, UploadGCS}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeUploads = %#v, want %#v", got, want)
+	}
+}
+
+func TestNormalizeUploadsRejectsUnsupportedProvider(t *testing.T) {
+	if _, err := normalizeUploads([]string{"elastic"}); err == nil || !strings.Contains(err.Error(), "unsupported --upload") {
+		t.Fatalf("normalizeUploads error = %v, want unsupported provider", err)
+	}
+}
+
+func TestResolveUploadDestinationsRequiresBucket(t *testing.T) {
+	t.Setenv(EnvS3Bucket, "")
+	_, err := resolveUploadDestinations([]string{"s3"}, nil, "/tmp/runtime.jsonl", "1700000000000000000-0a0b0c0d")
+	if err == nil || !strings.Contains(err.Error(), EnvS3Bucket) {
+		t.Fatalf("resolveUploadDestinations error = %v, want missing bucket", err)
+	}
+}
+
+func TestResolveUploadDestinationsRequiresUploadSession(t *testing.T) {
+	t.Setenv(EnvS3Bucket, "beacon-ci")
+	for _, session := range []string{"", " ", "..", "../../outside"} {
+		if _, err := resolveUploadDestinations([]string{"s3"}, nil, "/tmp/runtime.jsonl", session); err == nil {
+			t.Fatalf("resolveUploadDestinations(session %q) returned no error; an empty session folder would let sessions overwrite each other", session)
+		}
+	}
+}
+
+func TestResolveUploadDestinationsBuildsGitHubObjectKeys(t *testing.T) {
+	t.Setenv(EnvS3Bucket, "beacon-ci")
+	t.Setenv(EnvS3Prefix, "logs/")
+	run := &schema.RunInfo{
+		Repository: "asymptote-labs/agent-beacon",
+		RunID:      "123",
+		RunAttempt: "2",
+		Job:        "telemetry",
+	}
+	destinations, err := resolveUploadDestinations([]string{"s3"}, run, "/tmp/runtime.jsonl", "1700000000000000000-0a0b0c0d")
+	if err != nil {
+		t.Fatalf("resolveUploadDestinations returned error: %v", err)
+	}
+	if len(destinations) != 1 {
+		t.Fatalf("destinations = %d, want 1", len(destinations))
+	}
+	dest := destinations[0]
+	if dest.Key != "logs/asymptote-labs/agent-beacon/123/2/telemetry/1700000000000000000-0a0b0c0d/runtime.jsonl" {
+		t.Fatalf("Key = %q", dest.Key)
+	}
+	if dest.URI != "s3://beacon-ci/logs/asymptote-labs/agent-beacon/123/2/telemetry/1700000000000000000-0a0b0c0d/runtime.jsonl" {
+		t.Fatalf("URI = %q", dest.URI)
+	}
+	run.Job = ""
+	if got, want := uploadObjectKey("logs", run, "/tmp/runtime.jsonl", "s"), "logs/asymptote-labs/agent-beacon/123/2/s/runtime.jsonl"; got != want {
+		t.Fatalf("key without a job = %q, want %q", got, want)
+	}
+}
+
+func TestUploadObjectKeyStaysUnderPrefix(t *testing.T) {
+	session := "1700000000-abcd"
+	run := &schema.RunInfo{
+		Repository: "owner/repo",
+		RunID:      "../../../../outside",
+		RunAttempt: "1",
+		Job:        "build",
+	}
+	if got, want := uploadObjectKey("tenant/logs", run, "/tmp/runtime.jsonl", session), "tenant/logs/owner/repo/1/build/"+session+"/runtime.jsonl"; got != want {
+		t.Fatalf("key with a parent run id = %q, want %q", got, want)
+	}
+	run.RunID = "123"
+	run.Job = "../../../../../outside"
+	if got, want := uploadObjectKey("tenant/logs", run, "/tmp/../../etc/passwd", session), "tenant/logs/owner/repo/123/1/"+session+"/passwd"; got != want {
+		t.Fatalf("key with a parent job = %q, want %q", got, want)
+	}
+}
+
+func TestResolveUploadDestinationsBuildsFallbackObjectKeys(t *testing.T) {
+	t.Setenv(EnvGCSBucket, "beacon-ci")
+	destinations, err := resolveUploadDestinations([]string{"gcs"}, nil, "/tmp/runtime.jsonl", "42-0a0b0c0d")
+	if err != nil {
+		t.Fatalf("resolveUploadDestinations returned error: %v", err)
+	}
+	if got, want := destinations[0].Key, "ci/42-0a0b0c0d/runtime.jsonl"; got != want {
+		t.Fatalf("Key = %q, want %q", got, want)
+	}
+	if got, want := destinations[0].URI, "gs://beacon-ci/ci/42-0a0b0c0d/runtime.jsonl"; got != want {
+		t.Fatalf("URI = %q, want %q", got, want)
+	}
+}
+
+func TestUploadArtifactRunsS3Command(t *testing.T) {
+	calls, restore := stubUploadCommands(t, map[string]bool{"aws": true}, nil)
+	defer restore()
+
+	dest := UploadDestination{Provider: UploadS3, URI: "s3://bucket/key"}
+	result, err := uploadArtifact(context.Background(), "/tmp/runtime.jsonl", dest)
+	if err != nil {
+		t.Fatalf("uploadArtifact returned error: %v", err)
+	}
+	if result.Status != "ok" || result.Target != dest.URI {
+		t.Fatalf("result = %#v", result)
+	}
+	if got, want := strings.Join(*calls, "\n"), "aws s3 cp /tmp/runtime.jsonl s3://bucket/key"; got != want {
+		t.Fatalf("upload command = %q, want %q", got, want)
+	}
+}
+
+func TestUploadArtifactRunsGCloudCommand(t *testing.T) {
+	calls, restore := stubUploadCommands(t, map[string]bool{"gcloud": true}, nil)
+	defer restore()
+
+	dest := UploadDestination{Provider: UploadGCS, URI: "gs://bucket/key"}
+	if _, err := uploadArtifact(context.Background(), "/tmp/runtime.jsonl", dest); err != nil {
+		t.Fatalf("uploadArtifact returned error: %v", err)
+	}
+	if got, want := strings.Join(*calls, "\n"), "gcloud storage cp /tmp/runtime.jsonl gs://bucket/key"; got != want {
+		t.Fatalf("upload command = %q, want %q", got, want)
+	}
+}
+
+func TestUploadArtifactFallsBackToGsutil(t *testing.T) {
+	calls, restore := stubUploadCommands(t, map[string]bool{"gsutil": true}, nil)
+	defer restore()
+
+	dest := UploadDestination{Provider: UploadGCS, URI: "gs://bucket/key"}
+	if _, err := uploadArtifact(context.Background(), "/tmp/runtime.jsonl", dest); err != nil {
+		t.Fatalf("uploadArtifact returned error: %v", err)
+	}
+	if got, want := strings.Join(*calls, "\n"), "gsutil cp /tmp/runtime.jsonl gs://bucket/key"; got != want {
+		t.Fatalf("upload command = %q, want %q", got, want)
+	}
+}
+
+func TestUploadArtifactMissingCLI(t *testing.T) {
+	_, restore := stubUploadCommands(t, nil, nil)
+	defer restore()
+
+	result, err := uploadArtifact(context.Background(), "/tmp/runtime.jsonl", UploadDestination{Provider: UploadS3, URI: "s3://bucket/key"})
+	if err == nil || !strings.Contains(err.Error(), "aws CLI") {
+		t.Fatalf("uploadArtifact error = %v, want missing aws CLI", err)
+	}
+	if result.Status != "fail" {
+		t.Fatalf("result status = %q, want fail", result.Status)
+	}
+}
+
+func TestUploadArtifactCommandFailure(t *testing.T) {
+	_, restore := stubUploadCommands(t, map[string]bool{"aws": true}, errors.New("boom"))
+	defer restore()
+
+	result, err := uploadArtifact(context.Background(), "/tmp/runtime.jsonl", UploadDestination{Provider: UploadS3, URI: "s3://bucket/key"})
+	if err == nil || !strings.Contains(err.Error(), "upload s3") {
+		t.Fatalf("uploadArtifact error = %v, want upload failure", err)
+	}
+	if result.Status != "fail" || result.Message != "boom" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func stubUploadCommands(t *testing.T, available map[string]bool, commandErr error) (*[]string, func()) {
+	t.Helper()
+	oldLookPath := uploadLookPath
+	oldRun := runUploadCommand
+	var calls []string
+	uploadLookPath = func(name string) (string, error) {
+		if available[name] {
+			return filepath.Join("/bin", name), nil
+		}
+		return "", exec.ErrNotFound
+	}
+	runUploadCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+		if commandErr != nil {
+			return []byte(commandErr.Error()), commandErr
+		}
+		return nil, nil
+	}
+	return &calls, func() {
+		if t.Failed() {
+			t.Logf("upload command calls: %s", fmt.Sprint(calls))
+		}
+		uploadLookPath = oldLookPath
+		runUploadCommand = oldRun
+	}
+}

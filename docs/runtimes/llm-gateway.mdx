@@ -1,0 +1,123 @@
+---
+title: "LLM Gateways"
+description: "Record agent activity from the model calls that pass through an LLM gateway"
+---
+
+## Overview
+
+Teams that route their agents' model traffic through an LLM gateway can record it there, without
+installing anything on developer machines. `beacon-gateway` (the `gateway/` module in this
+repository) attaches to the gateway's hook, decodes each model call, and writes Beacon events in
+the [runtime JSONL schema](/telemetry-schema/event-schema), marked
+`harness.collection_method: gateway`.
+
+A gateway sees the conversation as the model receives it: the system prompt, the tool catalog,
+the user's turns and the tool results on the way in, and the model's text, token counts and tool
+calls on the way out. It does not see the agent's own lifecycle (approvals, hooks, files the agent
+wrote without a tool call), so gateway events complement endpoint collection rather than replace
+it. `endpoint` on a gateway event is the gateway host, and `user` is the identity the gateway
+resolved for the call.
+
+## Supported gateways
+
+| Gateway | Hook | Protocols | Streamed replies | Token usage |
+|---------|------|-----------|------------------|-------------|
+| [LiteLLM proxy](/runtimes/gateways/litellm) | `generic_guardrail_api` guardrail, `pre_call` and `post_call` | All LiteLLM serves | Yes | No |
+| [Envoy, Envoy Gateway, Istio](/runtimes/gateways/envoy) | External Processing (`ext_proc`) filter | Anthropic Messages, Chat Completions, Responses | Yes | Yes |
+| [Portkey AI Gateway](/runtimes/gateways/portkey) | `default.webhook` guardrail | Chat Completions, Anthropic Messages | No | Yes (non-streamed) |
+
+Each page covers what that gateway exposes, how sessions and identity are named, and how to
+deploy it. One `beacon-gateway` process can serve several gateways at once: list one entry per
+gateway under `gateways`.
+
+Model protocols: Anthropic Messages, OpenAI Chat Completions and OpenAI Responses, as JSON or
+server-sent events.
+
+## Run it
+
+```bash title="Build and run"
+cd gateway
+go build -o beacon-gateway ./cmd/beacon-gateway
+./beacon-gateway -config deploy/beacon-gateway.yaml
+```
+
+`gateway/deploy/` holds a commented configuration and example LiteLLM and Envoy configurations.
+They observe only: LiteLLM lets calls through when the gateway is unreachable, and Envoy streams
+replies to the client as they arrive. Events go to the JSONL files the `outputs` section names;
+`beacon scan --log-path <file>` runs threat rules over them like any runtime log.
+
+To record identifiers, paths, commands, models and token usage but no prompt, reply, instructions,
+tool arguments or tool results, set:
+
+```yaml title="Metadata only"
+content:
+  retention: metadata
+```
+
+## Deployment notes
+
+These apply whichever gateway you attach to.
+
+- **Fail open.** Every shipped configuration lets model calls through unrecorded when
+  `beacon-gateway` is down or slow. Keep it that way: the open build observes only and never
+  blocks a call.
+- **Health and counters.** `/healthz` and `/stats` are served on the admin listener
+  (`admin: 127.0.0.1:4029`). `/stats` counts calls, calls let through unanalyzed when admission
+  was full, analysis failures and records dropped per output.
+- **Replicas.** The open build's `store` is in memory and per process. Run one `beacon-gateway`
+  per gateway replica (a sidecar), and expect a session whose calls land on several replicas to
+  record its system text and tool definitions once per replica.
+- **Load.** `pipeline.max_in_flight` (default two per CPU), `pipeline.max_body_bytes` and
+  `pipeline.queue_wait` bound the work in progress; a call that waits longer than `queue_wait`
+  goes through unrecorded. `gc.memory_limit` defaults to 80% of the container's memory limit.
+- **Outputs.** Write `beacon.event` records to a file your log shipper reads. The file uses the
+  runtime JSONL schema, so the same SIEM mappings apply.
+- **Memory.** Size the sidecar by `beacon-gateway`'s own memory. A container's memory usage
+  also counts the page cache of files written inside it, which Linux keeps until the container
+  runs short. On Linux the `jsonl` output tells the kernel to drop what it has written once it is
+  on disk, so its file adds a few tens of MB rather than filling the container to its limit.
+  Another file or a log written in the same container fills it the same way: send it to a log
+  shipper or another container, or read the container's working set rather than its usage.
+  After a busy spell the gateway returns its memory to the system once it has been idle for
+  about 30 seconds.
+- **Sessions.** Clients that send a session header get one session per conversation. Claude Code
+  sends `x-claude-code-session-id`; other clients can send `session_id`, `x-session-id` or
+  `conversation_id`, or set `pipeline.session_headers`.
+
+## What gets recorded
+
+| The call carries | Event |
+|------------------|-------|
+| System text, the first time a session sends it | `session.context` |
+| An MCP tool definition, the first time | `mcp.tool_listed` |
+| New user text | `prompt.submitted` |
+| The model's text | `agent.message` |
+| The reply's token counts | `token.usage` (`gen_ai.usage`) |
+| A shell, read or MCP tool call | `command.executed`, `file.read`, `mcp.tool_invoked` |
+| A fetch or any other tool call | `tool.invoked` |
+| A read's or MCP tool's result | `file.read`, `mcp.tool_invoked`, with the result and the call's arguments but not its path or MCP server, which the call carries |
+| Any other tool result | `tool.completed`, or `tool.failed` for an error |
+
+Tool calls are recorded when the model makes them, before the agent acts on them. Replies carry
+`gen_ai.response.id`, the provider's message id, which is the same id the endpoint's session
+readers record, so a gateway's and an endpoint's record of one model call can be matched.
+
+## Related
+
+<Columns cols={2}>
+  <Card title="Endpoint event schema" icon="code" href="/telemetry-schema/event-schema">
+    Fields and provenance markers, including the gateway collection method.
+  </Card>
+  <Card title="Integration model" icon="plug" href="/runtimes/integration-model">
+    How Beacon collects from each kind of agent runtime.
+  </Card>
+  <Card title="LiteLLM" icon="layer-group" href="/runtimes/gateways/litellm">
+    Guardrail API setup for the LiteLLM proxy.
+  </Card>
+  <Card title="Envoy, Envoy Gateway, Istio" icon="route" href="/runtimes/gateways/envoy">
+    External Processing setup for Envoy-based gateways.
+  </Card>
+  <Card title="Portkey" icon="shield-check" href="/runtimes/gateways/portkey">
+    Webhook guardrail setup for Portkey.
+  </Card>
+</Columns>

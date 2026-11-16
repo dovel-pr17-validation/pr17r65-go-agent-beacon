@@ -1,0 +1,431 @@
+package cmd
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/spf13/cobra"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon-hooks/internal/logging"
+)
+
+// beaconCursorHook is the command `beacon endpoint install` writes into ~/.cursor/hooks.json.
+func beaconCursorHook(command string) string {
+	return "'/Users/dev/.beacon/endpoint/hooks/beacon-hooks' --platform cursor --log '/var/log/beacon-agent/runtime.jsonl' --config '/Library/Application Support/Beacon/Endpoint/config.json' " + command
+}
+
+// cursorPreToolMatcher is the matcher `beacon endpoint install` gives Beacon's Cursor pre-tool hook.
+const cursorPreToolMatcher = "Write|Edit|MultiEdit|Shell|MCP"
+
+// writeCursorHooks installs a user-level Cursor hooks file holding these commands, by event.
+func writeCursorHooks(t *testing.T, hooks map[string][]string) {
+	t.Helper()
+	entries := map[string][]map[string]string{}
+	for event, commands := range hooks {
+		for _, command := range commands {
+			entries[event] = append(entries[event], map[string]string{"command": command})
+		}
+	}
+	writeCursorHookEntries(t, entries)
+}
+
+// writeCursorHookEntries installs a user-level Cursor hooks file holding these entries, by event.
+func writeCursorHookEntries(t *testing.T, entries map[string][]map[string]string) {
+	t.Helper()
+	data, err := json.Marshal(map[string]interface{}{"version": 1, "hooks": entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "hooks.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	original := cursorUserHooksPath
+	cursorUserHooksPath = func() string { return path }
+	t.Cleanup(func() { cursorUserHooksPath = original })
+}
+
+// setupCursorCompatRun prepares one hook run: the platform its entry declares, the subcommand it
+// runs, and an empty runtime log.
+func setupCursorCompatRun(t *testing.T, declared, command string) string {
+	t.Helper()
+	setupHookConfigDirs(t)
+	platformFlag = declared
+	hookCommand = command
+	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
+	t.Setenv("BEACON_ENDPOINT_LOG", logPath)
+	t.Cleanup(func() {
+		hookCommand = ""
+		duplicateCursorRun = false
+		logging.SuppressEndpointEvents(false)
+	})
+	return logPath
+}
+
+// countEndpointEvents is the number of events in the runtime log, zero when nothing created it.
+func countEndpointEvents(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatalf("read endpoint log: %v", err)
+	}
+	count := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func cursorPromptPayload() map[string]interface{} {
+	return map[string]interface{}{
+		"conversation_id": "conv-compat",
+		"generation_id":   "gen-1",
+		"hook_event_name": "beforeSubmitPrompt",
+		"prompt":          "summarize this repository",
+		"workspace_roots": []interface{}{"/repo"},
+	}
+}
+
+func TestClaudeHookRecordsNothingWhenCursorHooksRecordTheEvent(t *testing.T) {
+	writeCursorHooks(t, map[string][]string{"beforeSubmitPrompt": {beaconCursorHook("prompt-submit")}})
+
+	logPath := setupCursorCompatRun(t, "cursor", "prompt-submit")
+	native := runHookWithInput(t, runPromptSubmit, cursorPromptPayload())
+	if n := countEndpointEvents(t, logPath); n != 1 {
+		t.Fatalf("Cursor's own hook wrote %d events, want 1", n)
+	}
+
+	logPath = setupCursorCompatRun(t, "claude", "prompt-submit")
+	compat := runHookWithInput(t, runPromptSubmit, cursorPromptPayload())
+	if n := countEndpointEvents(t, logPath); n != 0 {
+		t.Fatalf("Claude Code hook run by Cursor wrote %d events, want 0", n)
+	}
+	// The reply is Cursor's, exactly as before: only the recording stepped aside.
+	if !reflect.DeepEqual(compat, native) {
+		t.Fatalf("Claude Code hook replied %#v, want Cursor's reply %#v", compat, native)
+	}
+}
+
+func TestClaudeHookRecordsCursorEventsWhenBeaconCursorHooksAreAbsent(t *testing.T) {
+	// No Cursor hooks file: the Claude Code hook is the only one recording Cursor, as before.
+	logPath := setupCursorCompatRun(t, "claude", "prompt-submit")
+	runHookWithInput(t, runPromptSubmit, cursorPromptPayload())
+	event := lastEndpointEvent(t, logPath)
+	if harness := event["harness"].(map[string]interface{})["name"]; harness != "cursor" {
+		t.Fatalf("harness = %q, want cursor", harness)
+	}
+	if action := event["event"].(map[string]interface{})["action"]; action != "prompt.submitted" {
+		t.Fatalf("event.action = %q, want prompt.submitted", action)
+	}
+}
+
+func TestClaudeHookRecordsCommandsBeaconCursorHooksDoNotRun(t *testing.T) {
+	// Beacon's Cursor hooks run session-start but nothing that records prompts.
+	writeCursorHooks(t, map[string][]string{"sessionStart": {beaconCursorHook("session-start")}})
+	logPath := setupCursorCompatRun(t, "claude", "prompt-submit")
+	runHookWithInput(t, runPromptSubmit, cursorPromptPayload())
+	if n := countEndpointEvents(t, logPath); n != 1 {
+		t.Fatalf("wrote %d events, want the prompt recorded once", n)
+	}
+}
+
+func TestOnlyBeaconCursorEntriesCount(t *testing.T) {
+	// A person's own Cursor hook that happens to end in the same word is not Beacon's.
+	writeCursorHooks(t, map[string][]string{"beforeSubmitPrompt": {"/usr/local/bin/my-audit prompt-submit"}})
+	logPath := setupCursorCompatRun(t, "claude", "prompt-submit")
+	runHookWithInput(t, runPromptSubmit, cursorPromptPayload())
+	if n := countEndpointEvents(t, logPath); n != 1 {
+		t.Fatalf("wrote %d events, want the prompt recorded once", n)
+	}
+}
+
+func TestClaudePayloadsStillRecordWithBeaconCursorHooksInstalled(t *testing.T) {
+	writeCursorHooks(t, map[string][]string{"beforeSubmitPrompt": {beaconCursorHook("prompt-submit")}})
+	logPath := setupCursorCompatRun(t, "claude", "prompt-submit")
+	runHookWithInput(t, runPromptSubmit, map[string]interface{}{
+		"session_id":      "claude-session",
+		"hook_event_name": "UserPromptSubmit",
+		"prompt":          "summarize this repository",
+		"cwd":             "/repo",
+	})
+	event := lastEndpointEvent(t, logPath)
+	if harness := event["harness"].(map[string]interface{})["name"]; harness != "claude_code" {
+		t.Fatalf("harness = %q, want claude_code", harness)
+	}
+}
+
+func TestSuppressionDoesNotOutliveTheRun(t *testing.T) {
+	writeCursorHooks(t, map[string][]string{"beforeSubmitPrompt": {beaconCursorHook("prompt-submit")}})
+	logPath := setupCursorCompatRun(t, "claude", "prompt-submit")
+	runHookWithInput(t, runPromptSubmit, cursorPromptPayload())
+	// The next run in the same process reads its own payload and decides afresh.
+	platformFlag = "claude"
+	runHookWithInput(t, runPromptSubmit, map[string]interface{}{
+		"session_id":      "claude-session",
+		"hook_event_name": "UserPromptSubmit",
+		"prompt":          "next prompt",
+		"cwd":             "/repo",
+	})
+	if n := countEndpointEvents(t, logPath); n != 1 {
+		t.Fatalf("wrote %d events, want only the Claude Code prompt", n)
+	}
+}
+
+func installBeaconCursorPreTool(t *testing.T) {
+	t.Helper()
+	writeCursorHookEntries(t, map[string][]map[string]string{
+		"preToolUse": {{"command": beaconCursorHook("pre-tool"), "matcher": cursorPreToolMatcher}},
+	})
+}
+
+func cursorToolPayload(tool string, toolInput map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"conversation_id": "conv-compat",
+		"hook_event_name": "preToolUse",
+		"tool_name":       tool,
+		"tool_input":      toolInput,
+	}
+}
+
+func TestClaudeHookSkipsToolCallsCursorsMatcherSelects(t *testing.T) {
+	installBeaconCursorPreTool(t)
+	for _, tool := range []string{"Write", "MCP:slack_send_message"} {
+		logPath := setupCursorCompatRun(t, "claude", "pre-tool")
+		runHookWithInput(t, runPreTool, cursorToolPayload(tool, map[string]interface{}{"file_path": "/repo/notes.md"}))
+		if n := countEndpointEvents(t, logPath); n != 0 {
+			t.Fatalf("%s: Claude Code hook run by Cursor wrote %d events, want 0", tool, n)
+		}
+	}
+}
+
+func TestClaudeHookStillCoversToolsOnlyItsMatcherSelects(t *testing.T) {
+	// Beacon's Cursor pre-tool hook doesn't select Read, so the Claude Code run is the only one
+	// that sees the call: it records it and asks the policy provider, as before.
+	installBeaconCursorPreTool(t)
+	logPath := setupPolicyTest(t, "claude", denyResponse)
+	hookCommand = "pre-tool"
+	t.Cleanup(func() {
+		hookCommand = ""
+		duplicateCursorRun = false
+		logging.SuppressEndpointEvents(false)
+	})
+	out := runHookWithInput(t, runPreTool, cursorToolPayload("Read", map[string]interface{}{"file_path": "/repo/.env"}))
+	if out["permission"] != "deny" {
+		t.Fatalf("Read reply = %#v, want the provider's deny", out)
+	}
+	assertDenialEvent(t, logPath)
+}
+
+// TestClaudeHookIgnoresAStaleEntryUnderTheWrongEvent reproduces cli/beacon's own
+// testdata/cursor_hooks_golden.json: an older Beacon version's env-prefix `pre-tool` command,
+// left behind under beforeShellExecution, has no matcher -- so it would select every tool if the
+// duplicate check scanned every event for the subcommand rather than only the event (preToolUse)
+// Beacon's current installer wires pre-tool to. A Read call, which only Claude's matcher selects,
+// must still be recorded and still reach the policy provider.
+func TestClaudeHookIgnoresAStaleEntryUnderTheWrongEvent(t *testing.T) {
+	writeCursorHookEntries(t, map[string][]map[string]string{
+		"beforeShellExecution": {{"command": "BEACON_ENDPOINT_MODE=1 BEACON_ENDPOINT_LOG=/tmp/old.jsonl /old/beacon-hooks --platform cursor pre-tool"}},
+		"preToolUse":           {{"command": beaconCursorHook("pre-tool"), "matcher": cursorPreToolMatcher}},
+	})
+	logPath := setupPolicyTest(t, "claude", denyResponse)
+	hookCommand = "pre-tool"
+	t.Cleanup(func() {
+		hookCommand = ""
+		duplicateCursorRun = false
+		logging.SuppressEndpointEvents(false)
+	})
+	out := runHookWithInput(t, runPreTool, cursorToolPayload("Read", map[string]interface{}{"file_path": "/repo/.env"}))
+	if out["permission"] != "deny" {
+		t.Fatalf("Read reply = %#v, want the provider's deny (the stale beforeShellExecution entry must not suppress it)", out)
+	}
+	assertDenialEvent(t, logPath)
+}
+
+func TestCursorMatcherSelects(t *testing.T) {
+	cases := []struct {
+		matcher, tool string
+		want          bool
+	}{
+		{"", "Read", true},
+		{"", "", true},
+		{cursorPreToolMatcher, "Write", true},
+		{cursorPreToolMatcher, "Shell", true},
+		{cursorPreToolMatcher, "MCP:slack_send_message", true},
+		{cursorPreToolMatcher, "Read", false},
+		{cursorPreToolMatcher, "Grep", false},
+		{cursorPreToolMatcher, "", false},
+		{"(", "Write", false},
+	}
+	for _, tc := range cases {
+		if got := cursorMatcherSelects(tc.matcher, tc.tool); got != tc.want {
+			t.Errorf("cursorMatcherSelects(%q, %q) = %v, want %v", tc.matcher, tc.tool, got, tc.want)
+		}
+	}
+}
+
+func TestDuplicateCursorRunDoesNotAskThePolicyProvider(t *testing.T) {
+	installBeaconCursorPreTool(t)
+	payload := func() map[string]interface{} {
+		return cursorToolPayload("Shell", map[string]interface{}{"command": "claude --dangerously-skip-permissions -p go"})
+	}
+	t.Cleanup(func() {
+		hookCommand = ""
+		duplicateCursorRun = false
+		logging.SuppressEndpointEvents(false)
+	})
+
+	// Cursor's own hook asks the provider and records the deny.
+	logPath := setupPolicyTest(t, "cursor", denyResponse)
+	hookCommand = "pre-tool"
+	if out := runHookWithInput(t, runPreTool, payload()); out["permission"] != "deny" {
+		t.Fatalf("Cursor's own hook replied %#v, want permission=deny", out)
+	}
+	assertDenialEvent(t, logPath)
+
+	// The Claude Code copy of the same call neither decides nor records.
+	logPath = setupPolicyTest(t, "claude", denyResponse)
+	hookCommand = "pre-tool"
+	if out := runHookWithInput(t, runPreTool, payload()); out["permission"] == "deny" {
+		t.Fatalf("duplicate run denied the call: %#v", out)
+	}
+	if n := countEndpointEvents(t, logPath); n != 0 {
+		t.Fatalf("duplicate run wrote %d events, want 0", n)
+	}
+}
+
+func TestCursorRecordsThisHookToleratesBadFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hooks.json")
+	original := cursorUserHooksPath
+	cursorUserHooksPath = func() string { return path }
+	t.Cleanup(func() { cursorUserHooksPath = original })
+
+	if cursorRecordsThisHook("prompt-submit", nil) {
+		t.Fatal("a missing file reported Beacon's Cursor hooks as installed")
+	}
+	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cursorRecordsThisHook("prompt-submit", nil) {
+		t.Fatal("an unreadable file reported Beacon's Cursor hooks as installed")
+	}
+	if cursorRecordsThisHook("", nil) {
+		t.Fatal("an unknown command matched")
+	}
+}
+
+// relayedCloudThought is an afterAgentThought payload as the Cursor desktop app sends it to the
+// user-level hooks while its Agents Window shows a cloud agent (captured on Cursor 3.30.8): the
+// cloud agent's id, no workspace and no transcript.
+func relayedCloudThought(conversationID string) map[string]interface{} {
+	return map[string]interface{}{
+		"conversation_id": conversationID,
+		"generation_id":   "",
+		"hook_event_name": "afterAgentThought",
+		"text":            "Exploring the repository layout first.",
+		"duration_ms":     float64(1200),
+		"transcript_path": nil,
+		"workspace_roots": []interface{}{},
+	}
+}
+
+func relayedCloudSubagentStop() map[string]interface{} {
+	return map[string]interface{}{
+		"conversation_id":        "bc-9af6e247-b89f-4ae9-9743-d5d5de5b8f81",
+		"parent_conversation_id": "bc-9af6e247-b89f-4ae9-9743-d5d5de5b8f81",
+		"generation_id":          "",
+		"hook_event_name":        "subagentStop",
+		"subagent_type":          "explore",
+		"status":                 "completed",
+		"summary":                "The repository is a Go module.",
+		"transcript_path":        nil,
+		"workspace_roots":        []interface{}{},
+	}
+}
+
+func TestCursorDesktopRelayOfACloudAgentRecordsNothing(t *testing.T) {
+	cases := []struct {
+		name     string
+		declared string
+		command  string
+		run      func(cmd *cobra.Command, args []string)
+		payload  map[string]interface{}
+	}{
+		{"the agent's reasoning", "cursor", "agent-thought", runAgentThought, relayedCloudThought("bc-9af6e247-b89f-4ae9-9743-d5d5de5b8f81")},
+		// A subagent's reasoning carries the subagent's own id, newline included, and no parent.
+		{"a subagent's reasoning", "cursor", "agent-thought", runAgentThought, relayedCloudThought("task-call-e65dd302-df4c-454d-b435-a575a7e1cef5-2\nfc_7ab70849-9c8e-9581-bea6-1a9338d8ee33_0")},
+		// Beacon's Cursor hooks run no subagent command, so this one arrives through the Claude Code
+		// hook Cursor also runs.
+		{"a subagent stopping, through the Claude Code hook", "claude", "subagent-stop", subagentStopCmd.Run, relayedCloudSubagentStop()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := setupCursorCompatRun(t, tc.declared, tc.command)
+			runHookWithInput(t, tc.run, tc.payload)
+			if n := countEndpointEvents(t, logPath); n != 0 {
+				t.Fatalf("wrote %d events for a cloud agent that never ran here, want 0", n)
+			}
+		})
+	}
+}
+
+func TestCursorCloudAgentsStillRecordWhereTheyRun(t *testing.T) {
+	t.Run("in a cloud sandbox", func(t *testing.T) {
+		t.Setenv("BEACON_ORIGIN", "cloud")
+		logPath := setupCursorCompatRun(t, "cursor", "agent-thought")
+		runHookWithInput(t, runAgentThought, relayedCloudThought("bc-9af6e247-b89f-4ae9-9743-d5d5de5b8f81"))
+		if n := countEndpointEvents(t, logPath); n != 1 {
+			t.Fatalf("wrote %d events, want the reasoning recorded", n)
+		}
+	})
+	t.Run("on a self-hosted worker, in a checkout", func(t *testing.T) {
+		payload := relayedCloudThought("bc-9af6e247-b89f-4ae9-9743-d5d5de5b8f81")
+		payload["workspace_roots"] = []interface{}{"/home/worker/repo"}
+		logPath := setupCursorCompatRun(t, "cursor", "agent-thought")
+		runHookWithInput(t, runAgentThought, payload)
+		if n := countEndpointEvents(t, logPath); n != 1 {
+			t.Fatalf("wrote %d events, want the reasoning recorded", n)
+		}
+	})
+	t.Run("a local conversation with no workspace open", func(t *testing.T) {
+		// The Agents Window runs local agents too, and without a folder they have no roots either.
+		logPath := setupCursorCompatRun(t, "cursor", "agent-thought")
+		runHookWithInput(t, runAgentThought, relayedCloudThought("8b01d14e-50f0-41f8-aa3f-6781f51243d4"))
+		if n := countEndpointEvents(t, logPath); n != 1 {
+			t.Fatalf("wrote %d events, want the reasoning recorded", n)
+		}
+	})
+	t.Run("a local subagent with no workspace open", func(t *testing.T) {
+		// A local subagent has a plain UUID of its own, never a task-call- id.
+		logPath := setupCursorCompatRun(t, "cursor", "agent-thought")
+		runHookWithInput(t, runAgentThought, relayedCloudThought("51762848-3459-4f0b-bdd8-f896f78f9acf"))
+		stop := relayedCloudSubagentStop()
+		stop["conversation_id"] = "8b01d14e-50f0-41f8-aa3f-6781f51243d4"
+		stop["parent_conversation_id"] = "8b01d14e-50f0-41f8-aa3f-6781f51243d4"
+		setupCursorCompatRun(t, "cursor", "subagent-stop")
+		t.Setenv("BEACON_ENDPOINT_LOG", logPath)
+		runHookWithInput(t, subagentStopCmd.Run, stop)
+		if n := countEndpointEvents(t, logPath); n != 2 {
+			t.Fatalf("wrote %d events, want the subagent's reasoning and its stop recorded", n)
+		}
+	})
+}
+
+func TestCursorDesktopRelayReplyIsUnchanged(t *testing.T) {
+	setupCursorCompatRun(t, "cursor", "agent-thought")
+	relayed := runHookWithInput(t, runAgentThought, relayedCloudThought("bc-9af6e247-b89f-4ae9-9743-d5d5de5b8f81"))
+	setupCursorCompatRun(t, "cursor", "agent-thought")
+	local := runHookWithInput(t, runAgentThought, relayedCloudThought("56b95d2b-bed7-4c60-9141-0b165f5dddbe"))
+	if !reflect.DeepEqual(relayed, local) {
+		t.Fatalf("relayed run replied %#v, want the local reply %#v", relayed, local)
+	}
+}

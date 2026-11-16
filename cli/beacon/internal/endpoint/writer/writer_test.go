@@ -1,0 +1,438 @@
+package writer
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
+)
+
+func TestAppendEventPrunesNumberedArchives(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runtime.jsonl")
+	for i := 0; i <= 3; i++ {
+		target := path
+		if i > 0 {
+			target = path + "." + strconv.Itoa(i)
+		}
+		if err := os.WriteFile(target, []byte("log-"+strconv.Itoa(i)), 0644); err != nil {
+			t.Fatalf("write %s: %v", target, err)
+		}
+	}
+	event := schema.NewEvent(schema.NewEventOptions{
+		Action:  "agent.detected",
+		Harness: schema.HarnessInfo{Name: "test"},
+		Message: "new event",
+	})
+
+	if _, err := AppendEvent(event, Options{Path: path, RotateSize: 1, RotateArchives: 2}); err != nil {
+		t.Fatalf("AppendEvent returned error: %v", err)
+	}
+	if _, err := os.Stat(path + ".3"); !os.IsNotExist(err) {
+		t.Fatalf("expected .3 archive to be pruned, err=%v", err)
+	}
+	if data, err := os.ReadFile(path + ".1"); err != nil || string(data) != "log-0" {
+		t.Fatalf(".1 = %q err=%v, want prior active log", string(data), err)
+	}
+	if data, err := os.ReadFile(path + ".2"); err != nil || string(data) != "log-1" {
+		t.Fatalf(".2 = %q err=%v, want prior .1 archive", string(data), err)
+	}
+}
+
+func TestAppendEventDedupesRuntimeEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.jsonl")
+	event := schema.NewEvent(schema.NewEventOptions{
+		Action:  "mcp.tool_invoked",
+		Harness: schema.HarnessInfo{Name: "cursor"},
+		Message: "Tool execution observed",
+	})
+	event.Timestamp = "2026-06-18T21:11:24Z"
+	event.Session = &schema.SessionInfo{ID: "s1"}
+	event.MCP = &schema.MCPInfo{Server: "clickhouse", Tool: "execute_sql"}
+	duplicate := event
+	duplicate.Harness.Name = "claude"
+	duplicate.Timestamp = "2026-06-18T21:11:25Z"
+
+	if _, err := AppendEvent(event, Options{Path: path}); err != nil {
+		t.Fatalf("first AppendEvent returned error: %v", err)
+	}
+	if _, err := AppendEvent(duplicate, Options{Path: path}); err != nil {
+		t.Fatalf("second AppendEvent returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected duplicate event to be suppressed, got %d lines: %s", len(lines), string(data))
+	}
+}
+
+func TestAppendEventSerializesConcurrentWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.jsonl")
+	event := schema.NewEvent(schema.NewEventOptions{
+		Action:  "agent.detected",
+		Harness: schema.HarnessInfo{Name: "test"},
+		Message: "concurrent event",
+	})
+	var wg sync.WaitGroup
+	errs := make(chan error, 20)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := AppendEvent(event, Options{Path: path, RotateSize: 64 * 1024})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("AppendEvent returned error: %v", err)
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 20 {
+		t.Fatalf("expected 20 complete lines, got %d: %s", len(lines), string(data))
+	}
+	for _, line := range lines {
+		var decoded map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &decoded); err != nil {
+			t.Fatalf("line is not JSON: %v line=%q", err, line)
+		}
+	}
+}
+
+func TestAppendEventRejectsInvalidEvent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.jsonl")
+	event := schema.NewEvent(schema.NewEventOptions{
+		Action:  "tool.invoked",
+		Harness: schema.HarnessInfo{Name: "test"},
+	})
+	event.Event.Action = ""
+
+	if _, err := AppendEvent(event, Options{Path: path}); err == nil {
+		t.Fatal("expected validation error")
+	}
+}
+
+func TestAppendEventRejectsOversizedEventAfterTruncation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.jsonl")
+	event := schema.NewEvent(schema.NewEventOptions{
+		Action:  "tool.invoked",
+		Harness: schema.HarnessInfo{Name: strings.Repeat("h", 2048)},
+		Message: strings.Repeat("m", 2048),
+	})
+
+	if _, err := AppendEvent(event, Options{Path: path, MaxBytes: 512}); err == nil {
+		t.Fatal("expected oversized event error")
+	}
+}
+
+func TestSanitizeEventRedactsToolPolicyAndRawValues(t *testing.T) {
+	event := schema.NewEvent(schema.NewEventOptions{
+		Action:  "tool.invoked",
+		Harness: schema.HarnessInfo{Name: "test"},
+		Message: "authorization=Bearer message-secret",
+	})
+	event.Tool = &schema.ToolInfo{
+		Command: "curl -H 'Authorization: Bearer command-secret'",
+		Path:    strings.Repeat("p", 3000),
+	}
+	event.Policy = &schema.PolicyInfo{Reason: "api_key=policy-secret"}
+	event.Prompt = &schema.PromptInfo{Text: "token=prompt-secret"}
+	event.Raw = map[string]interface{}{
+		"nested": map[string]interface{}{"token": "token=raw-secret"},
+		"items": []interface{}{
+			map[string]interface{}{"value": "authorization: Bearer slice-secret"},
+		},
+	}
+
+	sanitized := SanitizeEvent(event, MaxEventBytes)
+	data, err := json.Marshal(sanitized)
+	if err != nil {
+		t.Fatalf("marshal sanitized event: %v", err)
+	}
+	text := string(data)
+	for _, secret := range []string{"message-secret", "command-secret", "policy-secret", "prompt-secret", "raw-secret", "slice-secret"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("secret %q was not redacted: %s", secret, text)
+		}
+	}
+	if len(sanitized.Tool.Path) > 2048 {
+		t.Fatalf("tool path was not truncated: %d", len(sanitized.Tool.Path))
+	}
+}
+
+// Redaction has to happen on the way to disk, not only in SanitizeEvent: session sync, git linking
+// and share records all write through AppendEvent, and the runtime log is what gets exported. The
+// secrets are read back from the file itself, nested slice included.
+func TestAppendEventWritesNoSecretToTheLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.jsonl")
+	event := schema.NewEvent(schema.NewEventOptions{
+		Action:  "tool.invoked",
+		Harness: schema.HarnessInfo{Name: "test"},
+		Message: "token=message-secret",
+	})
+	event.Prompt = &schema.PromptInfo{Text: "api_key=prompt-secret"}
+	event.Raw = map[string]interface{}{
+		"items": []interface{}{
+			map[string]interface{}{"value": "authorization: Bearer slice-secret"},
+		},
+	}
+
+	if _, err := AppendEvent(event, Options{Path: path}); err != nil {
+		t.Fatalf("AppendEvent returned error: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	for _, secret := range []string{"message-secret", "prompt-secret", "slice-secret"} {
+		if strings.Contains(string(data), secret) {
+			t.Fatalf("secret %q reached the log: %s", secret, data)
+		}
+	}
+	var decoded schema.Event
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &decoded); err != nil {
+		t.Fatalf("the log line is not one JSON event: %v", err)
+	}
+}
+
+var uuidV5Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// The stamped ID and the derived trace are both read back from the line on disk.
+func TestAppendEventStampsAStableEventIDAndDerivedTrace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.jsonl")
+	event := schema.NewEvent(schema.NewEventOptions{
+		Action:  "command.executed",
+		Harness: schema.HarnessInfo{Name: "claude_code"},
+		Message: "Shell command executed",
+	})
+	event.Timestamp = "2026-08-21T18:00:01Z"
+	event.Session = &schema.SessionInfo{ID: "s1"}
+	event.Command = &schema.CommandInfo{Command: "echo hi"}
+	event.GenAI = &schema.GenAIInfo{Tool: &schema.GenAIToolInfo{Call: &schema.GenAIToolCallInfo{ID: "toolu_1"}}}
+
+	written, err := AppendEvent(event, Options{Path: path})
+	if err != nil {
+		t.Fatalf("AppendEvent returned error: %v", err)
+	}
+	if written != path {
+		t.Fatalf("AppendEvent wrote %q, want %q", written, path)
+	}
+
+	line, err := LastLine(path)
+	if err != nil {
+		t.Fatalf("read last line: %v", err)
+	}
+	var decoded schema.Event
+	if err := json.Unmarshal([]byte(line), &decoded); err != nil {
+		t.Fatalf("decode written event: %v", err)
+	}
+	if decoded.Trace == nil || decoded.Trace.ID != "session:claude_code:s1" || decoded.Trace.SpanID != "toolu_1" {
+		t.Fatalf("trace = %#v, want derived session trace and tool span", decoded.Trace)
+	}
+	if !uuidV5Pattern.MatchString(decoded.Event.ID) {
+		t.Fatalf("event.id = %q, want an RFC 4122 version 5 UUID", decoded.Event.ID)
+	}
+	// The ID has to describe the line it is on, so re-deriving it from that line
+	// with the field cleared has to land on the same value.
+	bare := decoded
+	bare.Event.ID = ""
+	data, err := json.Marshal(bare)
+	if err != nil {
+		t.Fatalf("re-marshal event: %v", err)
+	}
+	if got := asymptoteobserve.EventIDForLine(data); got != decoded.Event.ID {
+		t.Fatalf("event.id = %s, but the written line derives %s", decoded.Event.ID, got)
+	}
+}
+
+// The regression the call ID exists to fix: after harness normalization both
+// capture paths report claude_code, and the collector's batch lands seconds
+// after the hook's write. Nothing but a shared call ID can collapse that pair.
+func TestAppendEventCollapsesTheHookAndCollectorReportsOfOneCall(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.jsonl")
+	hook := schema.NewEvent(schema.NewEventOptions{
+		Action:  "command.executed",
+		Harness: schema.HarnessInfo{Name: "claude_code"},
+		Message: "Shell command executed",
+	})
+	hook.Timestamp = "2026-08-21T18:00:01Z"
+	hook.Session = &schema.SessionInfo{ID: "s1"}
+	hook.Command = &schema.CommandInfo{Command: "echo hi"}
+	hook.GenAI = &schema.GenAIInfo{Tool: &schema.GenAIToolInfo{Call: &schema.GenAIToolCallInfo{ID: "toolu_1"}}}
+
+	collector := hook
+	collector.Timestamp = "2026-08-21T18:00:07Z"
+	collector.Message = "Tool execution observed"
+
+	if _, err := AppendEvent(hook, Options{Path: path}); err != nil {
+		t.Fatalf("first AppendEvent returned error: %v", err)
+	}
+	if _, err := AppendEvent(collector, Options{Path: path}); err != nil {
+		t.Fatalf("second AppendEvent returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if lines := strings.Split(strings.TrimSpace(string(data)), "\n"); len(lines) != 1 {
+		t.Fatalf("one Bash call was recorded %d times: %s", len(lines), string(data))
+	}
+}
+
+// RetainedLogPaths must name exactly the files rotation keeps: a reader walking it for history
+// older than the live file (doctor's dsh_hook_capture looks for the last hook event) would
+// otherwise miss an archive, or look for one that can never exist.
+func TestRetainedLogPathsMatchesWhatRotationKeeps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runtime.jsonl")
+	for i := 0; i < DefaultRotateArchives*2+3; i++ {
+		event := schema.NewEvent(schema.NewEventOptions{
+			Action:  "agent.detected",
+			Harness: schema.HarnessInfo{Name: "test"},
+			Message: "event " + strconv.Itoa(i),
+		})
+		if _, err := AppendEvent(event, Options{Path: path, RotateSize: 1}); err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+	}
+
+	retained := RetainedLogPaths(path)
+	if len(retained) != DefaultRotateArchives+1 || retained[0] != path {
+		t.Fatalf("RetainedLogPaths = %v, want the live log then %d archives", retained, DefaultRotateArchives)
+	}
+	want := map[string]bool{}
+	for _, p := range retained {
+		want[p] = true
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("%s is listed as retained but rotation did not keep it: %v", p, err)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		name := filepath.Join(dir, entry.Name())
+		if strings.HasSuffix(name, ".lock") {
+			continue
+		}
+		if !want[name] {
+			t.Fatalf("rotation kept %s, which RetainedLogPaths does not list", name)
+		}
+	}
+	if got := RetainedLogPaths(""); got != nil {
+		t.Fatalf("RetainedLogPaths(\"\") = %v, want nil", got)
+	}
+}
+
+// A tool call whose arguments hold many strings (a multi-edit, a long todo list) stays over the size
+// limit after raw is dropped and the message is cut, because each string is capped but their number
+// is not. The hook adapter and the collector exporter then drop the retained content and keep the
+// event; this writer used to fail it, and a session sweep that gets an error stops at that line and
+// meets it again on every later sweep.
+func TestAppendEventKeepsAnOversizedToolCallWithoutItsRetainedContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.jsonl")
+	edits := make([]interface{}, 0, 40)
+	for i := 0; i < 40; i++ {
+		edits = append(edits, map[string]interface{}{
+			"old_string": strings.Repeat("a", 3000),
+			"new_string": strings.Repeat("b", 3000),
+		})
+	}
+	event := schema.NewEvent(schema.NewEventOptions{
+		Action:  "tool.invoked",
+		Harness: schema.HarnessInfo{Name: "test"},
+		Message: "MultiEdit",
+	})
+	event.GenAI = &schema.GenAIInfo{Tool: &schema.GenAIToolInfo{
+		Name: "MultiEdit",
+		Call: &schema.GenAIToolCallInfo{ID: "call_1", Arguments: map[string]interface{}{"edits": edits}},
+	}}
+
+	if _, err := AppendEvent(event, Options{Path: path}); err != nil {
+		t.Fatalf("AppendEvent dropped the event instead of compacting it: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if len(data) > MaxEventBytes+1 {
+		t.Fatalf("line is %d bytes, over the %d byte limit", len(data), MaxEventBytes)
+	}
+	var decoded schema.Event
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("line is not an event: %v", err)
+	}
+	if !decoded.Truncated {
+		t.Fatal("a compacted event must say it was truncated")
+	}
+	if decoded.GenAI == nil || decoded.GenAI.Tool == nil || decoded.GenAI.Tool.Call == nil || decoded.GenAI.Tool.Call.ID != "call_1" {
+		t.Fatalf("the tool call's identity must survive compaction: %+v", decoded.GenAI)
+	}
+}
+
+// A prompt event whose gen_ai held only the turn's input is left with nothing in gen_ai once the
+// input goes, and the line must not carry an empty "gen_ai":{} object.
+func TestAppendEventDropsAnEmptiedGenAIObject(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.jsonl")
+	parts := make([]interface{}, 0, 40)
+	for i := 0; i < 40; i++ {
+		parts = append(parts, map[string]interface{}{"type": "text", "content": strings.Repeat("p", 3000)})
+	}
+	event := schema.NewEvent(schema.NewEventOptions{
+		Action:  "prompt.submitted",
+		Harness: schema.HarnessInfo{Name: "test"},
+		Message: "prompt",
+	})
+	event.GenAI = &schema.GenAIInfo{Input: &schema.GenAIInputInfo{Messages: []interface{}{
+		map[string]interface{}{"role": "user", "parts": parts},
+	}}}
+
+	if _, err := AppendEvent(event, Options{Path: path}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if strings.Contains(string(data), `"gen_ai"`) {
+		t.Fatalf("compacted line kept an empty gen_ai object:\n%s", data)
+	}
+}
+
+// AppendEvent may write a JSON object of exactly MaxEventBytes and then a newline.
+// The scanner has to hold that newline or it reports the legal line as too long.
+func TestLastLineReadsAMaxSizedEvent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.jsonl")
+	payload := append(append([]byte(`"`), bytes.Repeat([]byte("x"), MaxEventBytes-2)...), '"')
+	if err := os.WriteFile(path, append(append([]byte("short\n"), payload...), '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	line, err := LastLine(path)
+	if err != nil {
+		t.Fatalf("LastLine: %v", err)
+	}
+	if line != string(payload) {
+		t.Fatalf("LastLine returned %d bytes, want %d", len(line), len(payload))
+	}
+}

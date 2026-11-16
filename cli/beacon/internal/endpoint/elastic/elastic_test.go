@@ -1,0 +1,281 @@
+package elastic
+
+import (
+	"bufio"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+)
+
+func TestInstallPackWritesExpectedFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := InstallPack(dir, "/tmp/beacon/runtime.jsonl"); err != nil {
+		t.Fatalf("InstallPack returned error: %v", err)
+	}
+	for _, name := range []string{
+		"README.md",
+		"filebeat.yml",
+		"elastic-agent-standalone.yml",
+		"ilm-policy.json",
+		"component-template-mappings.json",
+		"component-template-settings.json",
+		"index-template.json",
+		"ingest-pipeline.json",
+		"kibana-assets.ndjson",
+		"docker-compose.yml",
+		"sample-event.jsonl",
+	} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("expected %s: %v", name, err)
+		}
+	}
+	filebeat, err := os.ReadFile(filepath.Join(dir, "filebeat.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(filebeat), "/tmp/beacon/runtime.jsonl") {
+		t.Fatalf("generated filebeat.yml missing configured log path: %s", filebeat)
+	}
+	for _, emptyCredential := range []string{`api_key: "${ES_API_KEY:}"`, `username: "${ES_USERNAME:}"`, `password: "${ES_PASSWORD:}"`} {
+		if strings.Contains(string(filebeat), emptyCredential) {
+			t.Fatalf("generated filebeat.yml should not emit empty credential defaults: %s", emptyCredential)
+		}
+	}
+	compose, err := os.ReadFile(filepath.Join(dir, "docker-compose.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(compose), "${BEACON_LOG_DIR}:${BEACON_LOG_DIR}:ro") {
+		t.Fatalf("docker-compose.yml should mount the log directory at the same path: %s", compose)
+	}
+}
+
+func TestPackJSONFilesAreValid(t *testing.T) {
+	for _, path := range []string{
+		"pack/ilm-policy.json",
+		"pack/component-template-mappings.json",
+		"pack/component-template-settings.json",
+		"pack/index-template.json",
+		"pack/ingest-pipeline.json",
+	} {
+		var doc map[string]interface{}
+		if err := json.Unmarshal([]byte(mustRead(path)), &doc); err != nil {
+			t.Fatalf("%s is not valid JSON: %v", path, err)
+		}
+	}
+}
+
+func TestKibanaAssetsAreParseableNDJSON(t *testing.T) {
+	scanner := bufio.NewScanner(strings.NewReader(mustRead("pack/kibana-assets.ndjson")))
+	line := 0
+	var foundDataView, foundPromptColumn bool
+	for scanner.Scan() {
+		line++
+		var doc map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &doc); err != nil {
+			t.Fatalf("kibana-assets.ndjson line %d is not valid JSON: %v", line, err)
+		}
+		if doc["type"] == "" || doc["id"] == "" {
+			t.Fatalf("kibana-assets.ndjson line %d missing type/id: %#v", line, doc)
+		}
+		if doc["type"] == "index-pattern" {
+			attrs, ok := doc["attributes"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("kibana data view missing attributes: %#v", doc)
+			}
+			if attrs["name"] == "Beacon Endpoint Events" {
+				foundDataView = true
+			}
+		}
+		if doc["type"] == "search" {
+			attrs, ok := doc["attributes"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("kibana search missing attributes: %#v", doc)
+			}
+			columns, ok := attrs["columns"].([]interface{})
+			if !ok {
+				t.Fatalf("kibana search missing columns: %#v", attrs)
+			}
+			for _, column := range columns {
+				if column == "beacon.prompt.text" {
+					foundPromptColumn = true
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if line == 0 {
+		t.Fatal("kibana-assets.ndjson was empty")
+	}
+	if !foundDataView {
+		t.Fatal("kibana-assets.ndjson should include the Beacon Endpoint Events data view")
+	}
+	if !foundPromptColumn {
+		t.Fatal("kibana saved search should expose beacon.prompt.text so prompts are visible in Elastic")
+	}
+}
+
+func TestSampleEventsCoverHookAndOTelShapes(t *testing.T) {
+	scanner := bufio.NewScanner(strings.NewReader(mustRead("pack/sample-event.jsonl")))
+	var sawHook, sawOTel bool
+	for scanner.Scan() {
+		var doc map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &doc); err != nil {
+			t.Fatalf("sample-event.jsonl is not valid JSONL: %v", err)
+		}
+		if raw, ok := doc["raw"].(map[string]interface{}); ok && raw["otel_signal"] != nil {
+			sawOTel = true
+		}
+		if _, ok := doc["tool"].(map[string]interface{}); ok {
+			sawHook = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !sawHook || !sawOTel {
+		t.Fatalf("sample events should include hook-rich and OTel shapes, sawHook=%t sawOTel=%t", sawHook, sawOTel)
+	}
+}
+
+func TestIngestPipelineMentionsKeyMappings(t *testing.T) {
+	pipeline := mustRead("pack/ingest-pipeline.json")
+	for _, want := range []string{"event.duration", "'otel'", "host.hostname", "process.command_line", "gen_ai"} {
+		if !strings.Contains(pipeline, want) {
+			t.Fatalf("ingest pipeline missing %s", want)
+		}
+	}
+	if strings.Contains(pipeline, "event.action = 'file.' + ctx.file.operation") {
+		t.Fatal("ingest pipeline should preserve Beacon file actions instead of deriving lossy file operation actions")
+	}
+}
+
+func TestInputSnippet_DefaultLogPath(t *testing.T) {
+	got, err := InputSnippet("")
+	if err != nil {
+		t.Fatalf("InputSnippet with empty path returned error: %v", err)
+	}
+	want, err := InputSnippet(DefaultLogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("InputSnippet with empty logPath should use DefaultLogPath %q, got: %s", DefaultLogPath, got)
+	}
+}
+
+// The native vcs block (session.commit_linked events) must not collide with the ECS vcs fields the
+// pipeline derives from repository and branch: it is kept whole under beacon.vcs, and the ECS
+// fields prefer its remote URL, branch and revision.
+func TestIngestPipelineKeepsNativeVCS(t *testing.T) {
+	pipeline := mustRead("pack/ingest-pipeline.json")
+	for _, want := range []string{
+		"ctx.remove('vcs')",
+		"beacon.vcs = nativeVcs",
+		"nativeVcs.repository.url.full",
+		"'head').revision = vcsRevision",
+	} {
+		if !strings.Contains(pipeline, want) {
+			t.Fatalf("ingest pipeline missing %s", want)
+		}
+	}
+	// The native block is read before the ECS fields are written, or the first write would replace
+	// the remote URL with the local path.
+	if strings.Index(pipeline, "ctx.remove('vcs')") > strings.Index(pipeline, "ensure(ensure(ctx, 'vcs'), 'repository').url") {
+		t.Fatal("native vcs must be captured before ECS vcs fields are set")
+	}
+	var mappings map[string]interface{}
+	if err := json.Unmarshal([]byte(mustRead("pack/component-template-mappings.json")), &mappings); err != nil {
+		t.Fatal(err)
+	}
+	props := mappings["template"].(map[string]interface{})["mappings"].(map[string]interface{})["properties"].(map[string]interface{})
+	beacon := props["beacon"].(map[string]interface{})["properties"].(map[string]interface{})
+	if _, ok := beacon["vcs"]; !ok {
+		t.Fatal("beacon.vcs is not mapped")
+	}
+	sawLink := false
+	scanner := bufio.NewScanner(strings.NewReader(mustRead("pack/sample-event.jsonl")))
+	for scanner.Scan() {
+		if strings.Contains(scanner.Text(), `"session.commit_linked"`) {
+			sawLink = true
+		}
+	}
+	if !sawLink {
+		t.Fatal("sample events should include a session.commit_linked event")
+	}
+}
+
+// system_context says what a session.context event recorded, so it is copied under beacon.* and
+// mapped as keywords. gen_ai.system_instructions stays where the semconv puts it, mapped as the
+// parts list every writer now emits, so an index cannot be fixed to another shape by whichever
+// event arrives first.
+func TestIngestPipelineKeepsSystemContext(t *testing.T) {
+	pipeline := mustRead("pack/ingest-pipeline.json")
+	if !strings.Contains(pipeline, "if (ctx.system_context instanceof Map) { beacon.system_context = ctx.system_context; }") {
+		t.Fatal("ingest pipeline does not copy system_context under beacon")
+	}
+	var parsed struct {
+		Processors []map[string]map[string]interface{} `json:"processors"`
+	}
+	if err := json.Unmarshal([]byte(pipeline), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	removed := false
+	for _, processor := range parsed.Processors {
+		fields, _ := processor["remove"]["field"].([]interface{})
+		removed = removed || slices.Contains(fields, interface{}("system_context"))
+	}
+	if !removed {
+		t.Fatal("the source system_context is not removed after it is copied")
+	}
+
+	var mappings map[string]interface{}
+	if err := json.Unmarshal([]byte(mustRead("pack/component-template-mappings.json")), &mappings); err != nil {
+		t.Fatal(err)
+	}
+	props := mappings["template"].(map[string]interface{})["mappings"].(map[string]interface{})["properties"].(map[string]interface{})
+	context := props["beacon"].(map[string]interface{})["properties"].(map[string]interface{})["system_context"].(map[string]interface{})["properties"].(map[string]interface{})
+	skills := context["skills"].(map[string]interface{})["properties"].(map[string]interface{})
+	for name, mapping := range map[string]interface{}{"kind": context["kind"], "skill_name": skills["skill_name"], "skill_name_hash": skills["skill_name_hash"]} {
+		if mapping.(map[string]interface{})["type"] != "keyword" {
+			t.Fatalf("beacon.system_context %s mapping = %#v, want keyword", name, mapping)
+		}
+	}
+	instructions := props["gen_ai"].(map[string]interface{})["properties"].(map[string]interface{})["system_instructions"].(map[string]interface{})["properties"].(map[string]interface{})
+	if instructions["content"].(map[string]interface{})["type"] != "match_only_text" {
+		t.Fatalf("gen_ai.system_instructions.content mapping = %#v, want text", instructions["content"])
+	}
+}
+
+// prompt.id names the turn an event belongs to and is on events that carry no prompt text, so the
+// pipeline copies it into beacon.prompt on its own -- not only alongside the text -- before the
+// remove processor drops the source prompt object, and the template maps it as a keyword.
+func TestIngestPipelineKeepsPromptID(t *testing.T) {
+	pipeline := mustRead("pack/ingest-pipeline.json")
+	for _, want := range []string{
+		"if (ctx.prompt.id != null) { ensure(beacon, 'prompt').id = ctx.prompt.id; }",
+		"if (ctx.prompt.text != null) { ensure(beacon, 'prompt').text = ctx.prompt.text; }",
+	} {
+		if !strings.Contains(pipeline, want) {
+			t.Fatalf("ingest pipeline missing %s", want)
+		}
+	}
+	if strings.Contains(pipeline, "ctx.prompt instanceof Map && ctx.prompt.text != null") {
+		t.Fatal("prompt is copied only when it has text, which drops prompt.id from every other event of a turn")
+	}
+	var mappings map[string]interface{}
+	if err := json.Unmarshal([]byte(mustRead("pack/component-template-mappings.json")), &mappings); err != nil {
+		t.Fatal(err)
+	}
+	props := mappings["template"].(map[string]interface{})["mappings"].(map[string]interface{})["properties"].(map[string]interface{})
+	beacon := props["beacon"].(map[string]interface{})["properties"].(map[string]interface{})
+	prompt := beacon["prompt"].(map[string]interface{})["properties"].(map[string]interface{})
+	if id, _ := prompt["id"].(map[string]interface{}); id["type"] != "keyword" {
+		t.Fatalf("beacon.prompt.id mapping = %#v, want keyword", prompt["id"])
+	}
+}

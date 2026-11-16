@@ -1,0 +1,1922 @@
+package asymptoteobserve
+
+import (
+	"encoding/json"
+	"maps"
+	"math"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
+	"unicode/utf8"
+)
+
+const (
+	DefaultStringLimit    = 4096
+	DefaultRawStringLimit = 2048
+)
+
+// redactedValue replaces a secret. Rules that match a labeled value keep the label (`token=`,
+// `Authorization: Bearer `, a URL's `scheme://user:`) and replace only the value, so the text still
+// says what was there.
+const redactedValue = "[REDACTED]"
+
+// The redaction tables below are named redact*, not secret*: static analysis treats a variable
+// named for a secret as sensitive data, and these hold patterns, not credentials.
+
+// redactLabel is the part of a label that marks the value after it as a secret: `token`,
+// `GITHUB_TOKEN`, `api_key`, `AWS_SECRET_ACCESS_KEY`, `"password"`. The label must end in the
+// marker, so `input_tokens: 812` and `max_tokens=4096` stay readable.
+const redactLabel = `[A-Za-z0-9_.-]*?(?:api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|client[_-]?secret|` +
+	`token|secret|password|passwd|passphrase|authorization|credentials?)`
+
+// redactSeparator runs from the end of a label to its value: an optional closing quote (escaped
+// too, for JSON quoted inside a string) and the separator.
+const redactSeparator = `(?:\\?["'` + "`" + `])?\s*[:=]\s*`
+
+// redactOpenQuote opens a quoted value, escaped or not.
+const redactOpenQuote = `\\?["'` + "`" + `]`
+
+// redactInQuotes is a value quoted with q, up to its own closing quote: spaces, commas, brackets,
+// the other quote characters and escaped characters, an escaped q among them, are part of it
+// (`"it's-mine"`, `"ab\"cd"`).
+func redactInQuotes(q string) string {
+	return `(?:[^` + q + `\\\n]|\\[^\n])+`
+}
+
+// redactInEscapedQuotes is a value whose opening quote was itself escaped (`\"`), which means it
+// sits inside a JSON string: there the escaped q is its closing quote, and any other escaped
+// character is part of it, a quote escaped twice (`\\\"`, the value's own quote) among them.
+func redactInEscapedQuotes(q string) string {
+	return `(?:[^` + q + `\\\n]|\\\\\\` + q + `|\\[^` + q + `\n])+`
+}
+
+// quotedValues pairs each way a value can be opened with the body it runs to: an escaped and a
+// plain opening for each quote character. Go has no backreferences, so each pair is its own rule.
+var quotedValues = [][2]string{
+	{`\\"`, redactInEscapedQuotes(`"`)}, {`"`, redactInQuotes(`"`)},
+	{`\\'`, redactInEscapedQuotes(`'`)}, {`'`, redactInQuotes(`'`)},
+	{"\\\\`", redactInEscapedQuotes("`")}, {"`", redactInQuotes("`")},
+}
+
+// quotedKind says what comes before a quoted value: a secret-named label or a secret-named flag.
+type quotedKind int
+
+const (
+	quotedAssignment quotedKind = iota
+	quotedFlag
+)
+
+// quotedRules builds one rule per quotedValues entry for the given kind of prefix.
+//
+// It takes the kind rather than the prefix pattern itself: static analysis reads a call whose
+// argument is a constant naming a credential (the pattern spells out "password") as returning that
+// credential, and these rules hold patterns, not secrets.
+func quotedRules(kind quotedKind, keep func(string) bool) []redactionRule {
+	prefix, words, separator, within, start := `\b`+redactLabel+redactSeparator, redactLabelWords, skipSeparator, redactLabelNeedles, startLabel
+	if kind == quotedFlag {
+		prefix, words, separator, within, start = redactFlag, redactFlagWords, skipFlagSeparator, redactFlagNeedles, startFlag
+	}
+	rules := make([]redactionRule, 0, len(quotedValues))
+	for _, quoted := range quotedValues {
+		// The pattern opens the value with this one quote right after the separator, so text
+		// where no label is followed by it cannot match.
+		open := strings.ReplaceAll(quoted[0], `\\`, `\`)
+		needles := newRedactNeedles(true, words...)
+		needles.within = within
+		needles.followedBy = func(rest string) bool {
+			rest, ok := separator(rest)
+			return ok && strings.HasPrefix(rest, open)
+		}
+		rules = append(rules, redactionRule{
+			expr: `(?i)(` + prefix + quoted[0] + `)(?P<value>` + quoted[1] + `)`, replacement: "${1}" + redactedValue,
+			keep: keep, needles: needles, start: start, runsOn: awsPairRunsOn,
+		})
+	}
+	return rules
+}
+
+// redactValueStops are the bytes an unquoted labeled value stops at: a quote, a comma and
+// whitespace (regexp's \s). redactUnquoted is built from them, and urlRunsOn reads a label's value
+// with them, so the two read the same value.
+const redactValueStops = redactQuotes + "," + regexpSpace
+
+// redactEscapedNonQuote is a backslash and the byte it escapes, unless that byte is a quote. An
+// unquoted value takes it, since a generated password is full of backslashes, but stops before a
+// backslash that escapes a quote: that is the closing quote of a value inside a JSON-encoded
+// string, such as a command held in a tool's arguments (`"curl -d \"token=x\""`), and a value that
+// took the backslash left a bare quote that ended the string early. redactUnquotedEnd reads values
+// the same way.
+const redactEscapedNonQuote = `\\[^` + redactQuotes + `]`
+
+// redactUnquoted is an unquoted value, up to one of redactValueStops or an escaped quote. Brackets,
+// braces, backslashes, `#`, `&` and `?` are part of it: a generated password is full of them. It
+// never starts with a quote, escaped or not, so it leaves a value the quoted rule already replaced
+// alone.
+const redactUnquoted = `(?:[^` + redactValueStops + `\\]|` + redactEscapedNonQuote + `)+`
+
+// redactParamStops are the bytes a URL query parameter's value stops at: redactValueStops, and
+// the `&` that opens the next parameter and the `#` that opens the fragment.
+const redactParamStops = redactValueStops + "&#"
+
+// redactParamValue is redactUnquoted for the value of a URL query parameter, a label opened by
+// `?` or `&`: `?api_key=x&user=alice` keeps `&user=alice`. Only there do `&` and `#` end a value;
+// after any other label they are a password's own characters (`DB_PASSWORD=#Xy9&z`).
+const redactParamValue = `(?:[^` + redactParamStops + `\\]|` + redactEscapedNonQuote + `)+`
+
+// redactUnquotedEnd is where an unquoted value starting at t[i] ends, read as redactUnquoted reads
+// it with stops: at a stop, or at a backslash that escapes a quote or ends the text. A backslash
+// takes the byte after it, whatever it is.
+func redactUnquotedEnd(t string, i int, stops string) int {
+	for i < len(t) {
+		if t[i] == '\\' {
+			if i+1 == len(t) || strings.IndexByte(redactQuotes, t[i+1]) >= 0 {
+				break
+			}
+			i += 2
+			continue
+		}
+		if strings.IndexByte(stops, t[i]) >= 0 {
+			break
+		}
+		i++
+	}
+	return i
+}
+
+// redactBare is a bare value after a quoted label: a JSON number or literal, which ends at the
+// structure around it.
+const redactBare = `[^"'` + "`" + `\\\s,{}\[\]][^"'` + "`" + `\\\s,{}\[\]]*`
+
+// redactFlagName is a command-line flag named for a secret: `--password`, `--token`, `-api-key`,
+// `--client_secret`, `--private-key`. The prefix class carries `_` as well as `-`, matching
+// redactLabel's `[A-Za-z0-9_.-]*?`: snake_case flags (`--client_secret`, `--api_key`,
+// `--access_key`) are the default naming style for argparse/click-style CLIs and otherwise passed
+// through unredacted. `secret[_-]?key` and `private[_-]?key` join the alternation for the same
+// reason redactLabel already has them (`--private-key`, `--secret-key`): openssl, ssh-keygen
+// wrappers and KMS/cloud CLIs commonly take a key material flag by that name.
+const redactFlagName = `--?[a-z0-9_-]*(?:password|passwd|passphrase|token|secret|api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key)`
+
+// redactFlag is a redactFlagName and its separator: `--password `, `--token=`, `-api-key `.
+const redactFlag = `(?:^|\s)` + redactFlagName + `(?:=|\s+)`
+
+// redactionRule is one redaction. ${1} and ${3}, when the pattern has them, are kept around the
+// value.
+type redactionRule struct {
+	// expr is the pattern. It is compiled the first time text gets past the needles: a hook is a
+	// process per event, and most events never need most rules, so compiling all of them up front
+	// cost every hook run a few milliseconds before it had read its input.
+	expr        string
+	replacement string
+	// keep, when set, leaves a match alone if its value (the group named value) passes.
+	keep func(value string) bool
+	// needles are literals the pattern cannot match without: when the text holds none of them,
+	// the rule is skipped without running the pattern.
+	needles *redactNeedles
+	// wholeLine marks a rule scoped to a command line: its pattern opens with the command word and
+	// the lazy run of the line (`\bcurl\b[^\n]*?`), so a match takes the first flag after the
+	// command, and the rest of the line is searched for the flag again (restOfLine).
+	wholeLine bool
+	// start says where, around an occurrence of one of its needles, a match can begin, and offset
+	// how many bytes before the needle a startNeedle match does. See redact_engine.go.
+	start  redactStart
+	offset int
+	// shape marks a credential recognized by its own shape: a public type prefix, ${1}, and the
+	// secret after it. Such a rule also redacts a secret written right after its match
+	// (redact_adjacent.go).
+	shape redactShapeKind
+	// runsOn, when set, returns the replacement of a match whose replaced text runs on past the
+	// match's end, and where that text ends; an end below 0 means the match is replaced as usual.
+	// It is a plain function of the rule, not a closure, so building the rules allocates nothing
+	// for it (TestPackageInitStaysCheap).
+	runsOn func(rule *redactionRule, t string, match []int) (replacement string, end int)
+}
+
+// pattern is the rule's compiled pattern.
+func (rule redactionRule) pattern() *regexp.Regexp {
+	return compiledPattern(rule.expr)
+}
+
+// redactNeedles is a set of literals a pattern cannot match without. folded needles are lower
+// case and found whatever the case of the text's ASCII letters, for a case-insensitive pattern.
+// followedBy, when set, must also hold for the text right after the needle, and precededBy for the
+// text before it; both read the text as it is, so they must not depend on the case of its letters.
+// within, when set, is a broader set the text must also hold.
+type redactNeedles struct {
+	id         int // its index in redactEngine.setMasks and the gate's sets
+	folded     bool
+	needles    []string
+	followedBy func(rest string) bool
+	precededBy func(before string) bool
+	within     *redactNeedles
+}
+
+var redactNeedleSets int
+
+func newRedactNeedles(folded bool, needles ...string) *redactNeedles {
+	if len(needles) == 0 {
+		panic("asymptoteobserve: a redaction rule needs at least one needle")
+	}
+	if redactNeedleSets >= idSetCap {
+		panic("asymptoteobserve: more redaction needle sets than an idSet holds; lengthen idSet")
+	}
+	set := &redactNeedles{id: redactNeedleSets, folded: folded, needles: needles}
+	redactNeedleSets++
+	return set
+}
+
+// rule is a case-sensitive rule that cannot match text holding none of needles. A match begins
+// where its needle does.
+func rule(expr, replacement string, keep func(string) bool, needles ...string) redactionRule {
+	return redactionRule{expr: expr, replacement: replacement, keep: keep, needles: newRedactNeedles(false, needles...)}
+}
+
+// foldedRule is a case-insensitive rule that cannot match text whose lower-cased form holds none
+// of needles, which must be lower case. A match begins where its needle does.
+func foldedRule(expr, replacement string, keep func(string) bool, needles ...string) redactionRule {
+	return redactionRule{expr: expr, replacement: replacement, keep: keep, needles: newRedactNeedles(true, needles...)}
+}
+
+// curlRule is a foldedRule scoped to a curl command line. A flag curl accepts more than once (two
+// -b cookie strings, two -u credentials) is redacted at every occurrence on the line.
+func curlRule(expr, replacement string) redactionRule {
+	r := foldedRule(expr, replacement, nil, "curl")
+	r.wholeLine = true
+	return r
+}
+
+// shapeRule is a rule for a credential recognized by its own shape (redactionRule.shape).
+func shapeRule(expr, replacement string, needles ...string) redactionRule {
+	r := rule(expr, replacement, nil, needles...)
+	r.shape = shapeToken
+	return r
+}
+
+// lazyPattern compiles expr the first time it is called.
+//
+// The rules whose pattern names a credential (redactLabel, redactFlag) are written as struct
+// literals rather than through rule or foldedRule: static analysis reads a call whose argument is
+// a constant spelling out "password" as returning that password, and would then treat every string
+// redaction returns, and every hash of one, as a credential.
+func lazyPattern(expr string) func() *regexp.Regexp {
+	return sync.OnceValue(func() *regexp.Regexp { return regexp.MustCompile(expr) })
+}
+
+// redactLabelWords are the words every redactLabel match ends in, lower-cased: each marker in its
+// alternation ends in one of them (api_key in "key", client_secret in "secret").
+var redactLabelWords = []string{"key", "secret", "token", "password", "passwd", "passphrase", "authorization", "credential", "credentials"}
+
+// redactLabelNeedles gate the rules that take a label and redactSeparator. A word that is not
+// followed by a separator (`input_tokens`, `keyboard`) cannot start a match. The rules share the
+// one set, so the gate searches for it once per text rather than once per rule.
+var redactLabelNeedles = func() *redactNeedles {
+	set := newRedactNeedles(true, redactLabelWords...)
+	set.followedBy = func(rest string) bool {
+		_, ok := skipSeparator(rest)
+		return ok
+	}
+	return set
+}()
+
+// redactQuotedLabelNeedles gate the rule whose label is closed by a quote before its separator.
+var redactQuotedLabelNeedles = func() *redactNeedles {
+	set := newRedactNeedles(true, redactLabelWords...)
+	set.within = redactLabelNeedles
+	set.followedBy = func(rest string) bool {
+		rest = strings.TrimPrefix(rest, `\`)
+		if rest == "" || !strings.ContainsRune(redactQuotes, rune(rest[0])) {
+			return false
+		}
+		_, ok := skipSeparator(rest)
+		return ok
+	}
+	return set
+}()
+
+// redactFlagWords are the words every redactFlag match ends in, lower-cased.
+var redactFlagWords = []string{"password", "passwd", "passphrase", "token", "secret", "key"}
+
+// redactFlagNeedles gate the flag rules: a flag's name is followed by `=` or whitespace, and is the
+// end of a word that starts with a dash at the start of the text or after whitespace.
+var redactFlagNeedles = func() *redactNeedles {
+	set := newRedactNeedles(true, redactFlagWords...)
+	set.followedBy = func(rest string) bool {
+		_, ok := skipFlagSeparator(rest)
+		return ok
+	}
+	set.precededBy = startsFlag
+	return set
+}()
+
+// redactListedFlagNeedles gate the rule for a flag and its value written as two quoted items of a
+// list: the flag's name is opened by a quote and a dash, and closed by a quote, a comma and the
+// quote opening the value.
+var redactListedFlagNeedles = func() *redactNeedles {
+	set := newRedactNeedles(true, redactFlagWords...)
+	set.followedBy = func(rest string) bool {
+		if rest == "" || (rest[0] != '"' && rest[0] != '\'') {
+			return false
+		}
+		rest = strings.TrimLeft(rest[1:], regexpSpace)
+		if !strings.HasPrefix(rest, ",") {
+			return false
+		}
+		rest = strings.TrimLeft(rest[1:], regexpSpace)
+		return rest != "" && (rest[0] == '"' || rest[0] == '\'')
+	}
+	set.precededBy = func(before string) bool {
+		start, ok := flagStart(before)
+		return ok && start > 0 && (before[start-1] == '"' || before[start-1] == '\'')
+	}
+	return set
+}()
+
+// startsFlag reports whether the text before a flag word ends in what redactFlag puts ahead of it:
+// `(?:^|\s)--?[a-z0-9_-]*`.
+func startsFlag(before string) bool {
+	start, ok := flagStart(before)
+	return ok && (start == 0 || strings.ContainsRune(regexpSpace, rune(before[start-1])))
+}
+
+// flagStart finds the dash that opens the flag the text before a flag word ends in: the start of
+// the run of letters, digits, underscores and dashes at its end. A pattern's `--?[a-z0-9_-]*` can
+// only begin where that maximal run does, because what it requires before the dash (whitespace, a
+// quote) is not part of the run. The patterns are case-insensitive, so the run takes capitals too:
+// the needle scan reads the text as it is, not lower-cased.
+func flagStart(before string) (int, bool) {
+	start := len(before)
+	for start > 0 {
+		c := before[start-1]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			break
+		}
+		start--
+	}
+	if redactWork != nil {
+		redactWork(len(before) - start)
+	}
+	if start == len(before) || before[start] != '-' {
+		return 0, false
+	}
+	return start, true
+}
+
+// redactQuotes are the quote characters redactSeparator and quotedValues know.
+const redactQuotes = "\"'`"
+
+// skipSeparator consumes what redactSeparator matches, `(?:\\?["'`])?\s*[:=]\s*`, from the start
+// of rest. Taking all the whitespace is what the pattern does too: nothing that may follow it can
+// start with whitespace.
+func skipSeparator(rest string) (string, bool) {
+	if strings.HasPrefix(rest, `\`) {
+		if len(rest) < 2 || !strings.ContainsRune(redactQuotes, rune(rest[1])) {
+			return "", false
+		}
+		rest = rest[2:]
+	} else if rest != "" && strings.ContainsRune(redactQuotes, rune(rest[0])) {
+		rest = rest[1:]
+	}
+	rest = strings.TrimLeft(rest, regexpSpace)
+	if rest == "" || (rest[0] != ':' && rest[0] != '=') {
+		return "", false
+	}
+	return strings.TrimLeft(rest[1:], regexpSpace), true
+}
+
+// skipFlagSeparator consumes the separator ending redactFlag, `(?:=|\s+)`, from the start of rest.
+func skipFlagSeparator(rest string) (string, bool) {
+	if strings.HasPrefix(rest, "=") {
+		return rest[1:], true
+	}
+	if trimmed := strings.TrimLeft(rest, regexpSpace); len(trimmed) < len(rest) {
+		return trimmed, true
+	}
+	return "", false
+}
+
+// regexpSpace is \s in Go's regexp syntax: ASCII whitespace, never Unicode.
+const regexpSpace = " \t\n\f\r"
+
+// redactAuthorizationLabel is an Authorization header's name and separator, as the header rules
+// read it: `Authorization: `, `AUTHORIZATION=`, `"authorization": "`, `Proxy-Authorization: `.
+const redactAuthorizationLabel = `authorization["']?\s*[:=]\s*["']?`
+
+// redactListedAuthSchemes are the Authorization schemes the header rule names, and whose name it
+// keeps: detection rules match on what kind of credential a line held. isAuthSchemeName reads the
+// same list.
+const redactListedAuthSchemes = `bearer|basic|token|digest`
+
+// redactAuthParam is one auth-param of an Authorization header (RFC 9110 §11.2): a name, `=`, and
+// a token or a quoted string.
+const redactAuthParam = `[a-z0-9_.-]+[ \t]*=[ \t]*(?:"(?:[^"\\\n]|\\.)*"|` + redactUnquoted + `)`
+
+// redactAuthCredentials is what follows an Authorization header's scheme: a comma-separated list
+// of auth-params, the way Digest, Hawk and AWS Signature V4 send theirs, or a single token (RFC
+// 9110's token68, or whatever a vendor sends, up to a stop). The list is taken whole, so no
+// parameter is left behind a marker that took only its name.
+const redactAuthCredentials = `(?:` + redactAuthParam + `(?:[ \t]*,[ \t]*` + redactAuthParam + `)*|` + redactUnquoted + `)`
+
+// isAuthScheme reports whether a labeled value is an Authorization scheme, alone or with its
+// credential already redacted, rather than a credential. `Authorization: Bearer x` is redacted to
+// `Authorization: Bearer [REDACTED]` by the header rule, and the assignment rules must not then
+// take the scheme for the value and erase what kind of credential the line held.
+func isAuthScheme(value string) bool {
+	fields := strings.Fields(value)
+	if len(fields) == 0 || len(fields) > 2 || (len(fields) == 2 && fields[1] != redactedValue) {
+		return false
+	}
+	return isAuthSchemeName(fields[0])
+}
+
+// isAuthSchemeName reports whether word is one of redactListedAuthSchemes.
+func isAuthSchemeName(word string) bool {
+	for rest := redactListedAuthSchemes; rest != ""; {
+		var name string
+		name, rest, _ = strings.Cut(rest, "|")
+		if strings.EqualFold(word, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// keepAuthorizationValue reports whether the rule for an Authorization value with any scheme should
+// leave a match alone, for the rules after it to read as they did before it existed:
+//   - The value opens with a scheme the header rule names. That rule has already replaced the
+//     credential after it and kept the scheme.
+//   - The second word is not a credential but the next item on the line: a flag named for a secret
+//     (`--token`, `--password=`) or a secret label and its separator (`password:`, `PASSWORD=`,
+//     `"api_key":`), whose own rule then redacts what it introduces; a short option (`-u`), whose
+//     value a command's own rule reads, as curl's; or a `#` comment. Taken as the credential,
+//     these would be replaced and the secret after them would stay. Any other word goes: a
+//     credential can start with `-` (base64url), and a long flag that names no secret is safe to
+//     replace.
+//
+// A list of auth-params, which holds a comma, is never kept: the rule takes it whole, values
+// included, so no label in it has a value left to lose.
+func keepAuthorizationValue(value string) bool {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return false
+	}
+	if isAuthSchemeName(fields[0]) {
+		return true
+	}
+	if len(fields) < 2 || strings.Contains(value, ",") {
+		return false
+	}
+	second := fields[1]
+	if second[0] == '#' || len(second) == 2 && second[0] == '-' && second[1] != '-' {
+		return true
+	}
+	if flag, _, _ := strings.Cut(second, "="); IsSecretFlag(flag) {
+		return true
+	}
+	if i := strings.IndexAny(second, ":="); i > 0 {
+		return labelEndsAt(second[:i+1])
+	}
+	return false
+}
+
+// authorizationCredentialCopy is the credential after scheme, the first word of an Authorization
+// header's value, which ends at t[end], for its bare copies elsewhere in the text to be removed as
+// an assigned value's are; or "". The capture of assigned values reads a label's value only up to
+// the blank after the scheme, so without this a copy of the credential (`… ; echo <key>`) stayed.
+// A match the header rules would not make is not taken: a first word that is no scheme-shaped
+// word, such as a marker an earlier pass left, or a match the any-scheme rule keeps. Nor is a list
+// of auth-params, whose labeled values the capture already takes, nor a word of letters alone,
+// which is more likely the next word of prose than a credential.
+func authorizationCredentialCopy(t, scheme string, end int) string {
+	if !isAuthSchemeWord(scheme) {
+		return ""
+	}
+	from := end
+	for from < len(t) && (t[from] == ' ' || t[from] == '\t') {
+		from++
+	}
+	if from == end {
+		return ""
+	}
+	credential := t[from:redactUnquotedEnd(t, from, redactValueStops)]
+	if strings.Contains(strings.TrimRight(credential, "="), "=") || onlyASCIILetters(credential) {
+		return ""
+	}
+	if !isAuthSchemeName(scheme) && keepAuthorizationValue(scheme+" "+credential) {
+		return ""
+	}
+	return credential
+}
+
+// isAuthSchemeWord reports whether word has the shape the any-scheme rule reads as a scheme,
+// `[a-z][a-z0-9_.-]*` in any case.
+func isAuthSchemeWord(word string) bool {
+	for i := range len(word) {
+		c := asciiLower(word[i])
+		if (c < 'a' || c > 'z') && (i == 0 || (c < '0' || c > '9') && c != '_' && c != '.' && c != '-') {
+			return false
+		}
+	}
+	return word != ""
+}
+
+func onlyASCIILetters(s string) bool {
+	for i := range len(s) {
+		if c := asciiLower(s[i]); c < 'a' || c > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
+// isRedactedJWTPrefix keeps the `eyJ` the header rule left in `Bearer eyJ[REDACTED]`, which the
+// bearer rule would otherwise take for a token of its own.
+func isRedactedJWTPrefix(value string) bool {
+	return value == "eyJ"
+}
+
+// isRedactedValue keeps a value an earlier pass already replaced, so redaction stays idempotent.
+func isRedactedValue(value string) bool {
+	return value == redactedValue
+}
+
+// isLiteralOrAuthScheme is isAuthScheme, plus the JSON literals that carry no secret.
+func isLiteralOrAuthScheme(value string) bool {
+	switch value {
+	case "null", "true", "false":
+		return true
+	}
+	return isAuthScheme(value)
+}
+
+var redactionRules = concatRules([]redactionRule{
+	// A private key block. The header must be followed by key material, so source code, a diff or
+	// grep output that only names the header keeps the text after it. Without an END line (the
+	// block was cut) the rest of the text goes.
+	rule(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----(?:\s|\\[rn]|(?:Proc-Type|DEK-Info|Comment|Version):[^\n\\]*)*`+
+		`[A-Za-z0-9+/=]{16,}[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----|$)`, redactedValue, nil, "-----BEGIN "),
+	// An Authorization header's credential after its scheme: Bearer, Basic, Token, Digest. A JWT
+	// keeps its public `eyJ` prefix, as the shape rules below keep theirs, so `Bearer eyJ[REDACTED]`
+	// still says a token was there where `Bearer [REDACTED]` may only have been the word "token" or
+	// a `$VARIABLE`. Digest's parameters go together (redactAuthCredentials).
+	foldedRule(`(?i)(`+redactAuthorizationLabel+`(?:`+redactListedAuthSchemes+`)[ \t]+(?-i:eyJ)?)(`+redactAuthCredentials+`)()`, "${1}"+redactedValue, nil, "authorization"),
+	foldedRule(`(?i)(\bbearer[ \t]+(?-i:eyJ)?)(?P<value>[a-z0-9._~+/=-]+)`, "${1}"+redactedValue, isRedactedJWTPrefix, "bearer"),
+	// An Authorization header with any other scheme: `ApiKey` (Elasticsearch), `SSWS` (Okta), `Bot`
+	// (Discord), `Splunk`, `Negotiate`, Hawk and AWS Signature V4's parameter lists, and whatever a
+	// vendor names its own. The label rules below read the scheme word as the value and stop at the
+	// blank after it, which replaced the scheme and left the credential in the text. The scheme and
+	// the credential go together here, as they already do when the value is quoted whole
+	// (`"Authorization": "ApiKey x"`). The first word is not kept the way a listed scheme is: a
+	// credential sent with no scheme is also one word, and kept as if it were a scheme it would stay
+	// whenever something follows it on the line. A second word that is a secret flag or a secret
+	// label is left to the rules for those (keepAuthorizationValue).
+	foldedRule(`(?i)(`+redactAuthorizationLabel+`)(?P<value>[a-z][a-z0-9_.-]*[ \t]+`+redactAuthCredentials+`)`, "${1}"+redactedValue, keepAuthorizationValue, "authorization"),
+	// A labeled assignment in prose, shell, env files, YAML, TOML or JSON: `token=x`,
+	// `export GITHUB_TOKEN="x"`, `{"api_key": "x"}`. The closing quote of a quoted label is allowed
+	// between the label and the separator. A quoted value runs to its closing quote; the unquoted
+	// rule never starts at a quote, so it leaves a value the quoted rule already replaced alone.
+}, quotedRules(quotedAssignment, isAuthScheme), []redactionRule{
+	// A quoted label with a bare value is JSON (or a YAML or Python mapping) holding a number, a
+	// literal or a structure. The replacement is quoted the way the label is, so the text still
+	// parses where something decodes it again (string-encoded tool arguments do); null, true, false
+	// and nested objects or arrays are left for their own fields' rules.
+	{
+		expr:        `(?i)(\b` + redactLabel + `(?P<q>` + redactOpenQuote + `)\s*[:=]\s*)(?P<value>` + redactBare + `)`,
+		replacement: "${1}${q}" + redactedValue + "${q}", keep: isLiteralOrAuthScheme, needles: redactQuotedLabelNeedles, start: startLabel,
+		runsOn: awsPairRunsOn,
+	},
+	// An unquoted value. A label opened by `?` or `&` is a URL query parameter, whose value ends
+	// at the `&` of the next one or the `#` of the fragment: `?api_key=x&user=alice` keeps
+	// `&user=alice`. The two are alternatives of one rule so that the parameter, which starts a
+	// byte earlier, is the match: a rule for the label alone, run after it, would read the
+	// redacted parameter as a value running on over `&user=alice`.
+	{
+		expr: `(?i)(?:([?&]` + redactLabel + `=)(?P<value>` + redactParamValue + `)|` +
+			`(\b` + redactLabel + `\s*[:=]\s*)(?P<value>` + redactUnquoted + `))`,
+		replacement: "${1}${3}" + redactedValue, keep: isAuthScheme, needles: redactLabelNeedles, start: startParam,
+		runsOn: awsPairRunsOn,
+	},
+	// A command-line flag: `--password x`, `--token=x`, `--api-key x`, and quoted, the way agents
+	// usually write arguments: `--password "x y"`, `--token='x'`. An unquoted value does not start
+	// with `=` or `:`, which is an assignment's separator after a word that only looks like a flag:
+	// a diff's removed line `-SECRET_KEY = 'x'`.
+}, quotedRules(quotedFlag, nil), []redactionRule{
+	{expr: `(?i)(` + redactFlag + `)([^\s"'=:-][^\s"']*)`, replacement: "${1}" + redactedValue, needles: redactFlagNeedles, start: startFlag, runsOn: awsPairRunsOn},
+	// A flag and its value as two quoted items of an argument list, the way an MCP server's args
+	// are written in JSON, TOML and YAML: `"args": ["--api-key", "x"]`.
+	{
+		expr:        `(?i)(["']` + redactFlagName + `["']\s*,\s*["'])(?P<value>(?:[^"'\n\\]|\\[^\n])+)`,
+		replacement: "${1}" + redactedValue, keep: isRedactedValue, needles: redactListedFlagNeedles, start: startListedFlag,
+		runsOn: awsPairRunsOn,
+	},
+	// curl's basic-auth credentials: `-u user:pass`, `-uuser:pass`, `--user user:pass` and
+	// `--proxy-user user:pass`. The user name and the colon stay. A bare `-u user` (curl prompts for
+	// the password) has nothing to redact, and the rule is limited to curl lines so `docker run -u
+	// 1000:1000` is left alone.
+	curlRule(`(?i)(\bcurl\b[^\n]*?\s(?:-[a-z]*u\s*|(?:--user|--proxy-user)(?:=|\s+))["']?[^:\s"']*:)([^\s"']+)`, "${1}"+redactedValue),
+	// curl's cookie flag with a cookie string: `-b 'sid=x; csrf=y'`, `--cookie sid=x`. Only a value
+	// holding `=` is cookies; anything else names a cookie file, which stays. The quotes stay.
+	curlRule(`(?i)(\bcurl\b[^\n]*?\s(?:-[a-z]*b\s*|--cookie(?:=|\s+)))(?:(')[^'\n]*=[^'\n]*(')|(")[^"\n]*=[^"\n]*(")|[^\s"'=]+=[^\s"']*)`, "${1}${2}${4}"+redactedValue+"${3}${5}"),
+	// A Cookie or Set-Cookie header: the whole value is a session credential, as the field-name rule
+	// in SanitizeMap already treats a structured `cookie` field. Only where a header or key can
+	// start (a line, a quote, curl's -H), so prose that says "cookie:" keeps its sentence.
+	foldedRule(`(?im)((?:^\s*|["']\s*|(?:-H|--header)(?:=|\s+)["']?)(?:set-)?cookie["']?\s*:\s*["']?)([^\n"'\\]+)`, "${1}"+redactedValue, isRedactedValue, "cookie").from(startLine),
+	// The password in a URL's userinfo: `postgres://user:pw@host`, `https://x-access-token:t@github.com`,
+	// and with no user name, the way Redis URLs carry a password: `redis://:pw@host`. The word the
+	// scheme ends can hold an `_`, which no scheme does: of `lsv2_sk_mysql://user:pw@host` the scheme
+	// is `mysql`, and the match starts with the word.
+	foldedRule(`(?i)(\b[a-z0-9_+.-]*?[a-z][a-z0-9+.-]*://[^/\s:@"'<>]*:)([^@/\s"'<>]+)(@)`, "${1}"+redactedValue+"${3}", nil, "://").from(startScheme).runningOn(urlRunningOn),
+	// Credentials recognizable by their own shape, wherever they appear. The type prefix is public
+	// and stays (`ghp_[REDACTED]`, `AKIA[REDACTED]`), the way secret scanners report a finding: the
+	// line still says a GitHub token or an AWS key was there, which is what detection rules match on
+	// in the log, and none of the credential is left. A secret written right after one of these is
+	// redacted with it, keeping its own prefix: `ghp_[REDACTED]ghp_[REDACTED]` (redact_adjacent.go).
+	shapeRule(`\b(sk-)[A-Za-z0-9_-]{20,}`, "${1}"+redactedValue, "sk-"), // Anthropic sk-ant-, OpenAI sk-proj- and sk-
+	// An AWS secret access key has no shape of its own, but where it follows its key id within a few
+	// separators (a credentials CSV, `aws configure` output, a table, a JSON array) it is the 40
+	// characters after them. The key id is replaced with it, as the key id rule below would: where
+	// this rule redacts a secret right after another one, the key id rule has already run.
+	shapeRule(redactAWSPair, "${1}"+redactedValue+"${2}"+redactedValue+"${3}", "AKIA", "ASIA"),
+	shapeRule(`\b(AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b`, "${1}"+redactedValue, "AKIA", "ASIA", "ABIA", "ACCA"),    // AWS access key id
+	shapeRule(`\b(gh[pousr]_)[A-Za-z0-9]{30,}`, "${1}"+redactedValue, "ghp_", "gho_", "ghu_", "ghs_", "ghr_"),   // GitHub tokens
+	shapeRule(`\b(github_pat_)[A-Za-z0-9_]{22,}`, "${1}"+redactedValue, "github_pat_"),                          // GitHub fine-grained tokens
+	shapeRule(`\b(glpat-)[A-Za-z0-9_-]{20,}`, "${1}"+redactedValue, "glpat-"),                                   // GitLab
+	shapeRule(`\b(xox[abeposr]-|xapp-)[A-Za-z0-9-]{10,}`, "${1}"+redactedValue, "xox", "xapp-"),                 // Slack, with xoxe- refresh and xapp- app-level tokens
+	shapeRule(`\b([rs]k_(?:live|test)_)[A-Za-z0-9]{16,}`, "${1}"+redactedValue, "k_live_", "k_test_").before(1), // Stripe
+	shapeRule(`\b(whsec_)[A-Za-z0-9]{32,}`, "${1}"+redactedValue, "whsec_"),                                     // Stripe webhook signing secret: Stripe's alphanumeric shape only, not other services' base64 whsec_ (Svix)
+	shapeRule(`\b(AIza)[0-9A-Za-z_-]{35}`, "${1}"+redactedValue, "AIza"),                                        // Google API key
+	shapeRule(`\b(ya29\.)(?:c\.)?[0-9A-Za-z_-]{20,}`, "${1}"+redactedValue, "ya29."),                            // Google OAuth access token
+	shapeRule(`\b(npm_)[A-Za-z0-9]{36}`, "${1}"+redactedValue, "npm_"),                                          // npm
+	shapeRule(`\b(hf_)[A-Za-z0-9]{30,}`, "${1}"+redactedValue, "hf_"),                                           // Hugging Face
+	// Model providers and developer platforms whose keys agents handle all day. Each length and
+	// alphabet is gitleaks' rule of the same name, or trufflehog's detector where gitleaks has none.
+	// Where prefixes differ in a letter or two, the rules share one needle (shp, lsv2_, _v1_): the
+	// engine tracks at most idSetCap distinct needles, and each new one spends a slot.
+	shapeRule(`\b(hv[sbr]\.)[A-Za-z0-9_-]{24,}`, "${1}"+redactedValue, "hvs.", "hvb.", "hvr."),            // HashiCorp Vault
+	shapeRule(`\b(gsk_)[A-Za-z0-9]{52}\b`, "${1}"+redactedValue, "gsk_"),                                  // Groq
+	shapeRule(`\b(pplx-)[A-Za-z0-9]{48}\b`, "${1}"+redactedValue, "pplx-"),                                // Perplexity
+	shapeRule(`\b(r8_)[A-Za-z0-9_-]{37}`, "${1}"+redactedValue, "r8_"),                                    // Replicate
+	shapeRule(`\b(xai-)[A-Za-z0-9_]{80}\b`, "${1}"+redactedValue, "xai-"),                                 // xAI
+	shapeRule(`\b(lsv2_(?:pt|sk)_)[0-9a-f]{32}_[0-9a-f]{10}\b`, "${1}"+redactedValue, "lsv2_"),            // LangSmith
+	shapeRule(`\b(pcsk_)[A-Za-z0-9]{5,6}_[A-Za-z0-9]{63}\b`, "${1}"+redactedValue, "pcsk_"),               // Pinecone
+	shapeRule(`\b(do[por]_v1_)[0-9a-f]{64}\b`, "${1}"+redactedValue, "_v1_").before(3),                    // DigitalOcean
+	shapeRule(`\b(dapi)[0-9a-f]{32}(?:-\d)?\b`, "${1}"+redactedValue, "dapi"),                             // Databricks
+	shapeRule(`\b(pypi-)AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}`, "${1}"+redactedValue, "pypi-AgEIcHlwaS5vcmc"), // PyPI upload token
+	shapeRule(`\b(shp(?:at|ca|pa|ss)_)[a-fA-F0-9]{32}\b`, "${1}"+redactedValue, "shp"),                    // Shopify
+	shapeRule(`\b(lin_api_)[A-Za-z0-9]{40}\b`, "${1}"+redactedValue, "lin_api_"),                          // Linear
+	shapeRule(`\b(dp\.pt\.)[A-Za-z0-9]{43}\b`, "${1}"+redactedValue, "dp.pt."),                            // Doppler
+	shapeRule(`\b(SG\.)[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}`, "${1}"+redactedValue, "SG."),                // SendGrid
+	shapeRule(`\b(PMAK-)[a-fA-F0-9]{24}-[a-fA-F0-9]{34}\b`, "${1}"+redactedValue, "PMAK-"),                // Postman
+	shapeRule(`\b(dckr_(?:pat|oat)_)[A-Za-z0-9_-]{27,}`, "${1}"+redactedValue, "dckr_"),                   // Docker Hub personal and organization access tokens
+	shapeRule(`\b(sbp_(?:oauth_|v0_)?)[a-f0-9]{40}\b`, "${1}"+redactedValue, "sbp_"),                      // Supabase personal access token
+	shapeRule(`\b(sb_secret_)[A-Za-z0-9_-]{22}_[A-Za-z0-9_-]{8,}`, "${1}"+redactedValue, "sb_secret_"),    // Supabase secret API key, as Supabase documents it; not the publishable key, which is public
+	shapeRule(`\b(nfp_)[A-Za-z0-9_]{36}\b`, "${1}"+redactedValue, "nfp_"),                                 // Netlify personal access token
+	// Beacon's own keys and tokens: API keys, device and enforcement keys, MCP tokens and their refresh
+	// tokens, and the CLI sign-in's access token, authorization code, client and exchange values.
+	shapeRule(`\b(bcn_(?:api|device|mcprt|mcp|enfdev|cli|code|client|exchange)_)[A-Za-z0-9_-]{8,}`, "${1}"+redactedValue, "bcn_"),
+	shapeRule(`\b(eyJ)[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`, "${1}"+redactedValue, "eyJ").segmented(), // JWT
+})
+
+func concatRules(groups ...[]redactionRule) []redactionRule {
+	var all []redactionRule
+	for _, group := range groups {
+		all = append(all, group...)
+	}
+	return all
+}
+
+// from returns the rule with its matches beginning where start says rather than at a needle.
+func (rule redactionRule) from(start redactStart) redactionRule {
+	rule.start = start
+	return rule
+}
+
+// before returns the rule with its matches beginning offset bytes before a needle.
+func (rule redactionRule) before(offset int) redactionRule {
+	rule.offset = offset
+	return rule
+}
+
+// segmented marks a shape rule whose secret is a JWT: three dot-separated segments, the first two
+// opening with `eyJ`, each of any length. redact_adjacent.go reads them itself to tell where one
+// ends without reading on to the end of the text each time it asks.
+func (rule redactionRule) segmented() redactionRule {
+	rule.shape = shapeJWT
+	return rule
+}
+
+// runningOn returns the rule with the text its matches replace running on where runsOn says.
+func (rule redactionRule) runningOn(runsOn func(rule *redactionRule, t string, match []int) (string, int)) redactionRule {
+	rule.runsOn = runsOn
+	return rule
+}
+
+// apply replaces every match of the rule in the gate's text, except one whose value keep passes.
+func (rule redactionRule) apply(text *redactGate, slot *redactSlot) string {
+	value := text.value
+	var out []byte
+	last, slashed := 0, false
+	for match, use := range rule.matches(text, slot) {
+		if match[0] < last {
+			continue // inside a match that ran on (redactionRule.runsOn)
+		}
+		if keep := use.rule.keep; keep != nil {
+			if group := 2 * valueGroup(use.pattern, match); match[group] >= 0 && keep(value[match[group]:match[group+1]]) {
+				text.hidden = text.hidden || keptLabel(value, match[group+1])
+				continue
+			}
+		}
+		out = append(out, value[last:match[0]]...)
+		replacement, end := use.rule.replacing(value, match)
+		out = use.pattern.ExpandString(out, replacement, value, match)
+		last = end
+		if use.rule.wholeLine {
+			out, last = use.rule.restOfLine(out, value, match[0], last)
+		}
+		// An AWS secret may hold a `/`, where the URL rule, which runs before the shape rules,
+		// stopped a password; once the secret is replaced, the password can run on to its `@`.
+		slashed = slashed || slashedAWSSecret(use.rule.expr, value, match)
+	}
+	if slashed && strings.Contains(value, "://") {
+		text.hidden = true
+	}
+	if out == nil {
+		return value
+	}
+	return string(append(out, value[last:]...))
+}
+
+// restOfLine redacts the flag of a wholeLine rule again and again on the rest of the command line
+// a match starting at start took the first flag of, from last, where that match's replacement
+// ended: one search over the line, however many flags it holds. A flag must start on the line, or
+// at the newline ending it, as the rule's lazy run requires; its value can reach the next lines
+// (commandLineEnd). The rule itself cannot find the next flag: its match opens with the command
+// word, which lies before the end of the last match.
+func (rule *redactionRule) restOfLine(out []byte, t string, start, last int) ([]byte, int) {
+	nl := len(t)
+	if i := strings.IndexByte(t[start:], '\n'); i >= 0 {
+		nl = start + i
+	}
+	if last > nl {
+		return out, last
+	}
+	end := commandLineEnd(t, last)
+	redactWorked(end - last)
+	re := rule.flagPattern()
+	from := last
+	for _, m := range re.FindAllStringSubmatchIndex(t[from:end], -1) {
+		for i := range m {
+			if m[i] >= 0 {
+				m[i] += from
+			}
+		}
+		if m[0] > nl {
+			break
+		}
+		out = append(out, t[last:m[0]]...)
+		out = re.ExpandString(out, rule.replacement, t, m)
+		last = m[1]
+	}
+	return out, last
+}
+
+// flagPattern is a wholeLine rule's pattern without the command word and the lazy run after it:
+// the flag and its value, in the same groups.
+func (rule *redactionRule) flagPattern() *regexp.Regexp {
+	const run = `\bcurl\b[^\n]*?`
+	if !strings.Contains(rule.expr, "("+run) {
+		panic("asymptoteobserve: a whole-line rule opens with `curl` and the lazy run of its line: " + rule.expr)
+	}
+	return compiledPattern(strings.Replace(rule.expr, run, "", 1))
+}
+
+// replacing returns the replacement of match in t, and where the text it replaces ends: the
+// match's end, unless the rule's match runs on (runsOn).
+func (rule *redactionRule) replacing(t string, match []int) (string, int) {
+	if rule.runsOn != nil {
+		if replacement, end := rule.runsOn(rule, t, match); end >= 0 {
+			return replacement, end
+		}
+	}
+	return rule.replacement, match[1]
+}
+
+// urlRunningOn is the URL rule's runsOn: where urlRunsOn says, the text up to there is replaced
+// with what the rule keeps before the password, ${1}, and a marker.
+func urlRunningOn(_ *redactionRule, t string, m []int) (string, int) {
+	return "${1}" + redactedValue, urlRunsOn(t, m)
+}
+
+// valueGroup returns the index of the group named value that took part in match, which a rule's
+// keep reads: a pattern with alternatives names one in each. A pattern that names none has its
+// value in the second group.
+func valueGroup(re *regexp.Regexp, match []int) int {
+	index := 2
+	for i, name := range re.SubexpNames() {
+		if name == "value" {
+			if index = i; match[2*i] >= 0 {
+				return i
+			}
+		}
+	}
+	return index
+}
+
+// urlRunsOn returns where the password of a URL match runs on to when the URL's user name is a
+// secret-named label (`https://x-access-token:…@`), which the label rules redact too, or -1. The
+// two stop at different bytes, a label's value at redactValueStops and a URL's password at an `@`,
+// a slash, a quote or whitespace, and once one has replaced its part, the other's runs on over the
+// marker; so each pass of the rules took one more piece of what follows, starting with the `@`.
+// The value runs on as far as the two take it in turn. That is where every later pass would leave
+// it because the label's value is read here with the stops redactUnquoted is built from: a label
+// in a user name is never a query parameter, whose separator is `=`, not the user name's `:`.
+//
+// The shape rules run after this one, and one of them changes where either run stops: an AWS key
+// id followed by its secret (awsPairAt), a secret recognized only after its key id, which holds
+// `/` and `+`. A label's value that ends in the key id would leave the secret with no key id
+// before it, so it takes the separators and the secret too (awsPairTailEnd); the password
+// reads the pair as the markers and separators the shape rule leaves of it.
+func urlRunsOn(t string, m []int) int {
+	if !labelEndsAt(t[:m[3]]) {
+		return -1
+	}
+	end := m[1]
+	for {
+		from := end
+		// The label's value: the marker the URL rule wrote and what follows it. A key id it ends
+		// in, before any separators it takes (`:`, `|`), takes its secret with it.
+		for run := end; ; {
+			end = redactUnquotedEnd(t, end, redactValueStops)
+			tailEnd := awsPairTailEnd(t, run, end)
+			if tailEnd < 0 {
+				break
+			}
+			end, run = tailEnd, tailEnd
+		}
+		// The URL's password: that value and what follows it up to an `@`.
+		at := end
+		for at < len(t) && t[at] != '@' && t[at] != '/' && !strings.ContainsRune("\"'<>", rune(t[at])) && !isRegexpSpace(t[at]) {
+			if sep, secretEnd := awsPairAt(t, at); secretEnd >= 0 {
+				// The key id and the secret become markers; the separators between them stay.
+				if stop := strings.IndexAny(t[sep:secretEnd], "\"'"+regexpSpace); stop >= 0 {
+					at = sep + stop
+					break
+				}
+				at = secretEnd
+				continue
+			}
+			at++
+		}
+		redactWorked(at - from)
+		if at == len(t) || t[at] != '@' {
+			return end
+		}
+		end = at + 1
+	}
+}
+
+// awsPairRunsOn is the runsOn of a rule for a labeled value or a flag's value: where the value
+// ends in an AWS access key id that its secret follows within a few separators, the replaced text
+// runs on to the secret's end. The value stops at a comma, a blank or a quote between them
+// (`token=AKIA…,<secret>`), and once it is replaced the rule for a key id and its secret finds no
+// key id before the secret. The match is replaced with the rule's replacement, the separators after
+// the value stay and the secret gets a marker of its own, as that rule writes a pair, so the value
+// reads the same to the next pass: `token=[REDACTED],[REDACTED]`. The separators are blanks,
+// commas and quotes, which an expansion template reads as they are.
+func awsPairRunsOn(rule *redactionRule, t string, match []int) (string, int) {
+	end := awsPairTailEnd(t, match[0], match[1])
+	if end < 0 {
+		return "", -1
+	}
+	return rule.replacement + t[match[1]:end-awsPairKeyLen] + redactedValue, end
+}
+
+// awsPairTailEnd returns where the secret ends that follows an AWS access key id the run
+// t[run:end] ends in, before any separators `:` and `|` it takes, or -1. The key id may be glued to
+// what comes before it in the run (`@hostAKIA…`), where the rules for key ids would not take it for
+// one: it is redacted as part of the run, and so is the secret.
+//
+// Forty bytes that a secret-named label with its separator starts in are no secret
+// (`<34 bytes>secret: x`, `<40 bytes>--db-password=x`): running on over them would hide the
+// label's own match, which starts inside what the run replaces, from its rule. A label is spelled
+// in bytes the secret holds too, and may go on past it (labelRunEnd), so the label is looked for
+// where that run ends.
+func awsPairTailEnd(t string, run, end int) int {
+	k := end
+	for k > run && end-k < 8 && (t[k-1] == ':' || t[k-1] == '|') {
+		k--
+	}
+	if k-run < awsKeyIDLen {
+		return -1
+	}
+	id := t[k-awsKeyIDLen : k]
+	if !strings.HasPrefix(id, "AKIA") && !strings.HasPrefix(id, "ASIA") {
+		return -1
+	}
+	for i := 4; i < awsKeyIDLen; i++ {
+		if c := id[i]; (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+			return -1
+		}
+	}
+	stop := min(len(t), k+awsPairTailSpan)
+	redactWorked(stop - k)
+	m := redactAWSPairTail().FindStringSubmatchIndex(t[k:stop])
+	if m == nil {
+		return -1
+	}
+	tail := k + m[3]
+	label := labelRunEnd(t, tail)
+	redactWorked(label - tail)
+	if keptLabel(t, label) {
+		return -1
+	}
+	return tail
+}
+
+// labelRunEnd returns the end of the run from i of the bytes a label is spelled with, as the
+// case-insensitive label rules read them: letters, digits, `_`, `.` and `-`, and ſ and K, which
+// fold into s and k.
+func labelRunEnd(t string, i int) int {
+	for i < len(t) {
+		switch {
+		case labelClass[t[i]]:
+			i++
+		case strings.HasPrefix(t[i:], "\u017f"):
+			i += len("\u017f")
+		case strings.HasPrefix(t[i:], "\u212a"):
+			i += len("\u212a")
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+// redactAWSPairTail is redactAWSPair after its key id: the separators, the secret (${1}) and
+// what ends it. The key id ends in a word byte and the separators hold none, so redactAWSPair's \b
+// holds where it starts.
+var redactAWSPairTail = lazyPattern(`^[\s,:|"']{1,8}([A-Za-z0-9/+]{40})(?:[^A-Za-z0-9/+=]|$)`)
+
+// awsPairTailSpan is the most redactAWSPairTail reads: eight separators, the secret and the byte
+// after it. Its `$` is the end of the text only where the slice is.
+const awsPairTailSpan = 8 + 40 + 1
+
+// redactAWSPair is an AWS access key id followed by its secret access key within a few separators:
+// ${1} the key id's type prefix, ${2} the separators, ${3} what ends the secret.
+const redactAWSPair = `(\b(?:AKIA|ASIA))[A-Z0-9]{16}(\b[\s,:|"']{1,8})[A-Za-z0-9/+]{40}([^A-Za-z0-9/+=]|$)`
+
+// awsKeyIDLen is the length of an AWS access key id, and awsPairKeyLen of its secret access key.
+const (
+	awsKeyIDLen   = 20
+	awsPairKeyLen = 40
+)
+
+var redactAWSPairAt = lazyPattern(`^` + redactAWSPair)
+
+// awsPairAt returns, where an AWS key id that the shape rule for a key id and its secret matches
+// starts at s in t, where the separators after the key id start and where the secret ends;
+// otherwise -1, -1.
+func awsPairAt(t string, s int) (sep, secretEnd int) {
+	if s > 0 && isWordByte(t[s-1]) || !strings.HasPrefix(t[s:], "AKIA") && !strings.HasPrefix(t[s:], "ASIA") {
+		return -1, -1
+	}
+	pair := redactAWSPairAt().FindStringSubmatchIndex(t[s:])
+	if pair == nil {
+		redactWorked(min(len(t)-s, 80))
+		return -1, -1
+	}
+	redactWorked(pair[1])
+	return s + pair[4], s + pair[6]
+}
+
+// labelEndsAt reports whether s ends with a secret-named label and its separator, as the label
+// rules read them: one of redactLabel's markers, an optional closing quote, and `:` or `=` with
+// whitespace around. `deploykey:` is no label; `api_key:` is.
+func labelEndsAt(s string) bool {
+	i := len(s)
+	for i > 0 && isRegexpSpace(s[i-1]) {
+		i--
+	}
+	if i == 0 || s[i-1] != ':' && s[i-1] != '=' {
+		return false
+	}
+	for i--; i > 0 && isRegexpSpace(s[i-1]); i-- {
+	}
+	if i > 0 && strings.IndexByte(redactQuotes, s[i-1]) >= 0 {
+		if i--; i > 0 && s[i-1] == '\\' {
+			i--
+		}
+	}
+	return redactLabelEnd().MatchString(s[max(0, i-32):i])
+}
+
+// redactLabelEnd matches text that ends in one of redactLabel's markers.
+var redactLabelEnd = lazyPattern(`(?i)(?:` + strings.TrimPrefix(redactLabel, `[A-Za-z0-9_.-]*?`) + `)$`)
+
+// redactAssignedRule captures the value of a labeled assignment, so a bare copy of it elsewhere in
+// the same text is removed too: a URL query parameter's (${1}), as the label rule reads it, then
+// one quoted with ", ' or a backtick, or an unquoted one (the last group).
+var redactAssignedRule = sync.OnceValue(func() redactionRule {
+	return redactionRule{
+		expr: `(?i)(?:[?&]` + redactLabel + `=(` + redactParamValue + `)|` +
+			`\b` + redactLabel + redactSeparator + `(?:` + quotedAlternatives() + `|(` + redactUnquoted + `)))`,
+		needles: redactLabelNeedles, start: startParam,
+	}
+})
+
+// quotedAlternatives is every quotedValues entry as one capturing alternative.
+func quotedAlternatives() string {
+	parts := make([]string, 0, len(quotedValues))
+	for _, quoted := range quotedValues {
+		parts = append(parts, quoted[0]+`(`+quoted[1]+`)`)
+	}
+	return strings.Join(parts, "|")
+}
+
+// redactWindow is how far past a string's limit redaction reads before the string is cut, so a
+// secret that straddles the cut is recognized whole rather than left as a recognizable prefix. It
+// covers a 4096-bit RSA private key block.
+const redactWindow = 4096
+
+type PrivacyOptions struct {
+	RedactSecrets bool
+	StringLimit   int
+}
+
+func RedactString(value string) string {
+	return redactString(value, true)
+}
+
+// redactString is RedactString; gated false runs every rule's whole pattern over the whole text
+// whatever the text holds, which the tests use to prove the gate and the needle-anchored matching
+// (redact_engine.go) never change a result.
+//
+// The gate is what keeps redaction affordable on the hook path, where it runs over every string of
+// every event before the agent may continue. Go's regexp engine has no DFA, so the case-insensitive
+// label rules cost microseconds on a short string and tens of milliseconds on a tool output of a
+// few kilobytes. Almost no text holds a needle of most rules, and one pass over the text finds
+// every needle of every rule at once.
+//
+// One pass is enough except where a match hides another that only a later rule uncovers. A rule
+// does not look inside a match whose value it keeps, nor the capture of assigned values inside a
+// value it takes, and that value can itself be a label with its separator (keptLabel): of
+// `token:seCret":token":0` the rule for a quoted label with a bare value keeps `seCret":token`
+// (`token` names an auth scheme) and never sees `token":0`; the rule for unquoted labels then
+// replaces `seCret`, the label that hid it, and only the next pass redacted `0`. Copies of
+// assigned values, replaced after every rule has run, can be where a match starts or ends
+// (copyHidesMatch); the URL rule stops a password at a `/` in an AWS secret, which the shape
+// rules replace after it; and a password after a replaced scheme is replaced only once every rule
+// has run (redactUserinfoAfterMarkers). Such text is redacted again until it stops changing, as
+// every later call would redact it. A pass can only uncover what the one before hid; texts the
+// tests and fuzzing have tried took at most three passes that change them, and redactMaxPasses
+// keeps the cost linear whatever the text.
+func redactString(value string, gated bool) string {
+	for pass := 1; ; pass++ {
+		out, hidden := redactPass(value, gated)
+		if !hidden || out == value || pass == redactMaxPasses {
+			return out
+		}
+		value = out
+	}
+}
+
+// redactMaxPasses bounds the passes redactString makes over text where a match hid another.
+const redactMaxPasses = 8
+
+// redactPass is one pass of every rule over value, and whether a match may have hidden another
+// (keptLabel, copyHidesMatch).
+func redactPass(value string, gated bool) (string, bool) {
+	engine := redactEngineFor()
+	text := redactGate{value: value, enabled: gated, engine: engine}
+	if text.holdsNothing() {
+		// Most text: no rule's needle, so no set holds and no rule can match.
+		return value, false
+	}
+	// Remember assignment values before replacing their labeled occurrence so
+	// repeated bare copies in the same retained prompt/output are also removed.
+	// This is common in model reasoning that quotes `token=value` and later
+	// refers to `value` by itself.
+	var assigned map[string]struct{}
+	var kept bool
+	if text.holds(redactLabelNeedles) {
+		assigned, kept = captureAssigned(&text, engine, assigned)
+		if len(assigned) > 0 {
+			text.copies = &copyIndex{values: assigned}
+		}
+	}
+	original := text.value
+	for i, rule := range redactionRules {
+		if !text.holds(rule.needles) {
+			continue
+		}
+		text.set(rule.apply(&text, &engine.rules[i]))
+	}
+	// A value the label rules keep part of can be captured whole and then changed by a later rule:
+	// of `"secret": null}…x-access-token:ghs_…`, the rule for quoted labels keeps `null`, the
+	// capture runs on to the end, and the rule for `x-access-token:` replaces the token inside it,
+	// so no copy of what was captured is left to remove. What the value became is captured too, so
+	// a second pass over the result finds nothing this one did not.
+	if kept && text.value != original {
+		assigned, _ = captureAssigned(&text, engine, assigned)
+	}
+	// Each copy is searched for and removed; none of it survives into the result. A secret right
+	// after a replaced copy, or right after a replaced key, starts a word only now.
+	replaced, glued := replaceAssigned(text.value, assigned)
+	hidden := text.hidden || replaced != text.value && copyHidesMatch(assigned, glued)
+	out, slashed := engine.redactAfterMarkers(replaced)
+	hidden = hidden || slashed && strings.Contains(out, "://")
+	if after := redactUserinfoAfterMarkers(out); after != out {
+		return after, true
+	}
+	return out, hidden
+}
+
+// redactUserinfoAfterMarkers replaces the password of a URL whose scheme a rule replaced: the
+// Bearer rule's token stops at a `:`, so of `Bearer postgres://user:pw@host` it takes the scheme,
+// and the URL rule, which needs a scheme before `://`, finds none in what is left. A copy of an
+// assigned value or a token can be replaced right before `://` too. It runs once every rule has
+// run and copies are replaced, on what a pass would return, so it only ever adds a replacement:
+// `Bearer [REDACTED]://user:[REDACTED]@host`. The user name and password are read as the URL rule
+// reads them.
+func redactUserinfoAfterMarkers(t string) string {
+	const scheme = redactedValue + "://"
+	var out []byte
+	last := 0
+	for from := 0; ; {
+		i := strings.Index(t[from:], scheme)
+		if i < 0 {
+			break
+		}
+		user := from + i + len(scheme)
+		from = user
+		colon := user
+		for colon < len(t) && strings.IndexByte(redactUserinfoNameStops, t[colon]) < 0 {
+			colon++
+		}
+		if colon == len(t) || t[colon] != ':' {
+			redactWorked(colon - user)
+			continue
+		}
+		at := colon + 1
+		for at < len(t) && strings.IndexByte(redactUserinfoValueStops, t[at]) < 0 {
+			at++
+		}
+		redactWorked(at - user)
+		if at == colon+1 || at == len(t) || t[at] != '@' {
+			continue
+		}
+		out = append(append(append(out, t[last:colon+1]...), redactedValue...), '@')
+		last, from = at+1, at+1
+	}
+	if out == nil {
+		return t
+	}
+	return string(append(out, t[last:]...))
+}
+
+// redactUserinfoNameStops and redactUserinfoValueStops end a URL's user name and password as the URL rule reads
+// them: `[^/\s:@"'<>]*:` and `[^@/\s"'<>]+@`.
+const (
+	redactUserinfoNameStops  = `/:@"'<>` + regexpSpace
+	redactUserinfoValueStops = `@/"'<>` + regexpSpace
+)
+
+// copyHidesMatch reports whether replacing copies of assigned values, which happens after every
+// rule has run, may have made a match where the rules found none: where a copy that starts with a
+// byte no word starts with was, which some rules' values cannot start with and their marker can;
+// where a copy held a byte a rule's value stops at (`/`, `@`, a quote, a comma, a blank), which
+// its marker does not; or where a word byte comes right before one (glued), which ends a word, or
+// a redacted secret, only now. Of `-pAsswd --token -token:"--token ` the flag finds no value in
+// `--token`, which starts with a dash, until the copy of the value `--token ` is replaced; of
+// `AKIAIOSFODNN7EXAMPLEAuthorization: Authorization: ` the key id rule finds no end before the
+// copy of `Authorization:` that the label holds. The next pass redacts them.
+func copyHidesMatch(assigned map[string]struct{}, glued bool) bool {
+	if glued {
+		return true
+	}
+	for s := range assigned {
+		if !isWordByte(s[0]) || strings.IndexFunc(s, stopsAValue) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// stopsAValue reports whether some rule's value may stop at r: any byte but a word byte, `.` and
+// `-`.
+func stopsAValue(r rune) bool {
+	return r >= utf8.RuneSelf || !isWordByte(byte(r)) && r != '.' && r != '-'
+}
+
+// markersAfterWords counts the markers in t that a word byte comes right before.
+func markersAfterWords(t string) int {
+	n := 0
+	for from := 0; ; {
+		i := strings.Index(t[from:], redactedValue)
+		if i < 0 {
+			return n
+		}
+		if p := from + i; p > 0 && isWordByte(t[p-1]) {
+			n++
+		}
+		from += i + len(redactedValue)
+	}
+}
+
+// keptLabel reports whether a value that ends at end in t, one a rule keeps or the capture takes,
+// is itself a secret-named label followed by its separator, as `token` is in `"secret":token":0`.
+func keptLabel(t string, end int) bool {
+	rest, ok := skipSeparator(t[end:])
+	return ok && labelEndsAt(t[:len(t)-len(rest)])
+}
+
+// captureAssigned adds the value of every labeled assignment in the gate's text to assigned. kept
+// reports whether one, of any length, was unquoted after a quoted label: the one way a value is
+// captured that the label rules may keep part of (redactBare stops where the capture runs on), so
+// that a later rule can change it, or make it long enough to remove.
+func captureAssigned(text *redactGate, engine *redactEngine, assigned map[string]struct{}) (_ map[string]struct{}, kept bool) {
+	value := text.value
+	add := func(s string) {
+		if len(s) >= redactCopyMin && s != redactedValue && !isAuthScheme(s) {
+			if assigned == nil {
+				assigned = map[string]struct{}{}
+			}
+			assigned[s] = struct{}{}
+		}
+	}
+	for match := range redactAssignedRule().matches(text, &engine.assigned) {
+		// The value is in one group: each way of writing it is an alternative.
+		g := 2
+		for g+1 < len(match) && match[g] < 0 {
+			g += 2
+		}
+		if g+1 >= len(match) {
+			continue
+		}
+		unquoted := g+2 == len(match)
+		kept = kept || unquoted && strings.ContainsAny(value[match[0]:match[g]], redactQuotes)
+		// A value that is itself a label hides the assignment it begins from the capture, as a kept
+		// one does from the label rules.
+		text.hidden = text.hidden || keptLabel(value, match[g+1])
+		s := value[match[g]:match[g+1]]
+		add(s)
+		if unquoted && containsFold(value[match[0]:match[g]], "authorization") {
+			add(authorizationCredentialCopy(value, s, match[g+1]))
+		}
+	}
+	return assigned, kept
+}
+
+// replaceAssigned replaces every copy of each assigned value with redactedValue in one pass.
+// Replacing them one strings.ReplaceAll at a time scanned the text once per assignment, and both
+// grow with the text, so the cost was quadratic: Beacon Cloud redacts uploaded shared traces with
+// this function, where that let a small gzip body hold a core for minutes. The values are a set,
+// longest first, so where two start at the same byte the longer is removed whole.
+//
+// It also reports whether a word byte comes right before a copy it replaced (copyHidesMatch). The
+// copies are first replaced with a NUL, where the text holds none, so their places can be read;
+// where it holds one, the markers that follow a word byte are counted before and after instead.
+func replaceAssigned(value string, assigned map[string]struct{}) (string, bool) {
+	if len(assigned) == 0 {
+		return value, false
+	}
+	values := slices.SortedFunc(maps.Keys(assigned), func(a, b string) int {
+		if len(a) != len(b) {
+			return len(b) - len(a)
+		}
+		return strings.Compare(a, b)
+	})
+	place := "\x00"
+	if strings.IndexByte(value, 0) >= 0 {
+		place = redactedValue
+	}
+	replaced, work := replaceLiterals(value, values, place)
+	redactWorked(work)
+	if place == redactedValue {
+		return replaced, markersAfterWords(replaced) > markersAfterWords(value)
+	}
+	glued := false
+	for i := strings.IndexByte(replaced, 0); i >= 0 && !glued; {
+		glued = i > 0 && isWordByte(replaced[i-1])
+		j := strings.IndexByte(replaced[i+1:], 0)
+		if j < 0 {
+			break
+		}
+		i += 1 + j
+	}
+	return strings.ReplaceAll(replaced, place, redactedValue), glued
+}
+
+// redactCopyMin is the least length of an assigned value whose copies are removed.
+const redactCopyMin = 8
+
+// IsSecretKeyName reports whether a structured field's name has a word naming a credential, for
+// callers that judge a field by its name alone. IsSecretField judges a value held under it.
+func IsSecretKeyName(key string) bool {
+	secret, _ := secretKeyName(key)
+	return secret
+}
+
+// IsSecretField reports whether a value is a credential by the name of the field holding it, the
+// rule SanitizeMap applies, for callers that walk structured values of their own. A value that
+// only names an auth scheme (`token_type: bearer`) is none, and nor is a number under a name whose
+// only credential word is "tokens", which is how a count of model tokens is named
+// (`max_tokens: 4096`, `input_tokens: "1200"`), where `GITHUB_TOKENS: abc` is a credential.
+func IsSecretField(key string, value interface{}) bool {
+	if text, ok := value.(string); ok {
+		return isSecretText(key, text)
+	}
+	secret, onlyTokens := secretKeyName(key)
+	return secret && !(onlyTokens && isNumber(value))
+}
+
+// isSecretText is IsSecretField for a string value, which the sanitizers hold as a string: making
+// it an interface{} to ask would allocate it again.
+func isSecretText(key, text string) bool {
+	secret, onlyTokens := secretKeyName(key)
+	return secret && !(onlyTokens && isNumberText(text)) && !isAuthScheme(text)
+}
+
+// isNumber reports whether a value is a number, or a string that only spells one.
+func isNumber(value interface{}) bool {
+	switch typed := value.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+		return true
+	case string:
+		return isNumberText(typed)
+	}
+	return false
+}
+
+// isNumberText reports whether a string only spells a number.
+func isNumberText(text string) bool {
+	digits, point := 0, false
+	for i := range len(text) {
+		switch c := text[i]; {
+		case c >= '0' && c <= '9':
+			digits++
+		case c == '.' && !point:
+			point = true
+		case c == '-' && i == 0:
+		default:
+			return false
+		}
+	}
+	return digits > 0
+}
+
+// IsSecretFlag reports whether an argument is a flag named for a secret written on its own, so the
+// next argument is its value: `--api-key`, `--token`, `-password`. SanitizeSlice redacts that next
+// argument, for callers that walk argument lists of their own.
+func IsSecretFlag(arg string) bool {
+	return strings.HasPrefix(arg, "-") && redactSecretFlagPattern().MatchString(arg)
+}
+
+var redactSecretFlagPattern = lazyPattern(`(?i)^` + redactFlagName + `$`)
+
+// secretKeyName reports whether a structured field's name says its value is a credential, and
+// whether the only word that says so is "tokens". The name is split into words at punctuation and
+// at camelCase, and a word naming a credential marks it wherever it stands: `GITHUB_TOKEN`,
+// `apiKey`, `X-Api-Key`, `X_AUTH`, `SECRET_KEY_BASE`, `DB_PASS`, `client_secret`, `Cookie`. A
+// name that runs one into the words before it (`PGPASSWORD`, `githubtoken`) is marked by how it
+// ends. `author`, `keyboard` and `PWD` are not secrets.
+func secretKeyName(key string) (secret, onlyTokens bool) {
+	// The lower-cased name is built in a buffer on the stack: this runs for every field of every
+	// map SanitizeMap sees, and a heap-allocated builder was most of its cost on short names.
+	var buf [64]byte
+	name := buf[:0]
+	start := 0
+	// tokenPending is a "token" word not yet judged: followed by "count" or "usage" it names a
+	// count (Codex and Gemini log `input_token_count`, `total_token_count`), like "tokens", and a
+	// number under it is no secret; followed by anything else, or nothing, it names a credential.
+	tokenPending := false
+	// endWord reports whether the word that ends here names a credential other than a token count,
+	// and starts the next one.
+	endWord := func() bool {
+		word := name[start:]
+		start = len(name)
+		if tokenPending {
+			tokenPending = false
+			if containsWord(tokenCountWords, word) {
+				onlyTokens = true
+				return false
+			}
+			return true
+		}
+		if string(word) == "tokens" {
+			onlyTokens = true
+			return false
+		}
+		if string(word) == "token" {
+			tokenPending = true
+			return false
+		}
+		return containsWord(redactKeyWords, word)
+	}
+	for i := range len(key) {
+		c := key[i]
+		switch {
+		case c >= 'a' && c <= 'z' || c >= '0' && c <= '9':
+			name = append(name, c)
+		case c >= 'A' && c <= 'Z':
+			// A capital starts a word after a lower-case letter or a digit (`apiKey`), and after
+			// other capitals when a lower-case letter follows it (`APIKey`).
+			if i > 0 && (isLowerOrDigit(key[i-1]) || isUpper(key[i-1]) && i+1 < len(key) && key[i+1] >= 'a' && key[i+1] <= 'z') && endWord() {
+				return true, false
+			}
+			name = append(name, c+'a'-'A')
+		default:
+			if endWord() {
+				return true, false
+			}
+		}
+	}
+	if endWord() || tokenPending {
+		return true, false
+	}
+	for _, suffix := range redactKeySuffixes {
+		if len(name) >= len(suffix) && string(name[len(name)-len(suffix):]) == suffix {
+			return true, false
+		}
+	}
+	return onlyTokens, onlyTokens
+}
+
+// containsWord reports whether word is one of words, without converting it to a string.
+func containsWord(words []string, word []byte) bool {
+	for _, w := range words {
+		if string(word) == w {
+			return true
+		}
+	}
+	return false
+}
+
+func isLowerOrDigit(c byte) bool { return c >= 'a' && c <= 'z' || c >= '0' && c <= '9' }
+
+func isUpper(c byte) bool { return c >= 'A' && c <= 'Z' }
+
+// redactKeyWords are the words of a field name that make it a credential's, with "tokens", which
+// secretKeyName reports apart. "pwd" is not one: PWD is the working directory.
+var redactKeyWords = []string{
+	"password", "passwords", "passwd", "pass", "passphrase", "secret", "secrets", "token", "key", "keys", "apikey",
+	"accesskey", "secretkey", "privatekey", "auth", "authorization", "credential", "credentials", "cookie",
+}
+
+// tokenCountWords, after "token", make a field name a count rather than a credential.
+var tokenCountWords = []string{"count", "counts", "usage"}
+
+// redactKeySuffixes mark a field name that runs a credential's word into the words before it.
+var redactKeySuffixes = []string{
+	"password", "passwd", "passphrase", "secret", "token", "apikey", "accesskey", "secretkey",
+	"privatekey", "authorization", "credential", "credentials", "cookie",
+}
+
+// TruncateUTF8 cuts value to at most limit bytes, backing up to the start of a character so a
+// multi-byte character is never split into invalid UTF-8.
+func TruncateUTF8(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	for limit > 0 && !utf8.RuneStart(value[limit]) {
+		limit--
+	}
+	return value[:limit]
+}
+
+// TruncateString cuts value to at most limit bytes on a character boundary, marking the cut
+// when limit leaves room for the marker.
+func TruncateString(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	if limit < 32 {
+		return TruncateUTF8(value, limit)
+	}
+	return TruncateUTF8(value, limit-15) + "...[truncated]"
+}
+
+// CleanString redacts before it truncates, so a cut can never leave part of a secret behind.
+// Redaction reads only a window past the limit, which keeps a multi-megabyte command output as
+// cheap as before.
+func CleanString(value string, limit int, redactSecrets bool) string {
+	if !redactSecrets {
+		return TruncateString(value, limit)
+	}
+	return TruncateString(redactBeforeCut(value, limit), limit)
+}
+
+// redactBeforeCut redacts value as far as a cut at limit needs: the whole of it, or a window past
+// the limit that still holds redactWindow bytes there once redacted. Everything up to the cut is
+// then redacted text.
+func redactBeforeCut(value string, limit int) string {
+	// Compared without adding to limit, which may be as large as math.MaxInt: a whole string within
+	// redactWindow of the limit, or shorter, is redacted whole.
+	if limit <= 0 || len(value)-limit <= redactWindow {
+		return RedactString(value)
+	}
+	// Redaction shortens what it matches, so a window that shrank pulls text from near its own cut
+	// inside the limit, where an unrecognizable fragment of a secret would survive. Widen the window
+	// until a full redactWindow of redacted text is left past the limit, or the whole string fits.
+	// Here limit+redactWindow < len(value), and the window doubles only while twice it is still
+	// shorter than value, so nothing overflows.
+	for window := limit + redactWindow; ; window *= 2 {
+		if redacted := RedactString(value[:window]); len(redacted) >= limit+redactWindow {
+			return redacted
+		}
+		if len(value)-window <= window {
+			return RedactString(value)
+		}
+	}
+}
+
+// SanitizeMap returns a sanitized copy of input: every string redacted (when opts.RedactSecrets is
+// set) and cut to opts.StringLimit, a value under a field named for a credential redacted whole,
+// at any depth.
+//
+// A value of a type JSON decoding does not produce ([]string, map[string]string, a struct, a
+// pointer, a named string type, json.RawMessage) is first converted into what encoding/json
+// writes for it, decoded back into an interface{}, then sanitized the same way (jsonValue); the
+// parts of it JSON cannot represent (a NaN, a channel, a function, a cycle) become nil. Booleans
+// and Go's number types are kept as they are, so an integer stays an integer. A []byte stays a
+// []byte (an OTLP bytes attribute keeps its type) and is redacted and cut (cleanBytes). A
+// CleanedValue is kept as CleanValue left it. The result always marshals.
+func SanitizeMap(input map[string]interface{}, opts PrivacyOptions) map[string]interface{} {
+	limit := opts.StringLimit
+	if limit <= 0 {
+		limit = DefaultStringLimit
+	}
+	out := make(map[string]interface{}, len(input))
+	for key, value := range input {
+		out[key] = sanitizeField(key, value, opts, limit)
+	}
+	return out
+}
+
+// sanitizeField is SanitizeMap's result for a value held under key.
+func sanitizeField(key string, value interface{}, opts PrivacyOptions, limit int) interface{} {
+	switch typed := value.(type) {
+	case string:
+		// A value whose field is named for a credential is one, whatever it looks like:
+		// `{"password": "hunter2"}` has no shape a pattern could recognize.
+		if opts.RedactSecrets && typed != "" && isSecretText(key, typed) {
+			return redactedValue
+		}
+		return CleanString(typed, limit, opts.RedactSecrets)
+	case map[string]interface{}:
+		return SanitizeMap(typed, opts)
+	case []interface{}:
+		// A multi-valued header (`{"Cookie": ["sid=1"]}`, OTel's http.request.header.*) is as
+		// much a credential as a single value.
+		if opts.RedactSecrets && IsSecretKeyName(key) {
+			return redactAllStrings(typed, opts)
+		}
+		return SanitizeSlice(typed, opts)
+	case []byte:
+		if opts.RedactSecrets && len(typed) > 0 && IsSecretField(key, string(typed)) {
+			return []byte(redactedValue)
+		}
+		return cleanBytes(typed, limit, opts.RedactSecrets)
+	case CleanedValue:
+		// The field's name still redacts it.
+		if opts.RedactSecrets && IsSecretKeyName(key) {
+			return sanitizeField(key, typed.value, opts, limit)
+		}
+		return typed
+	}
+	if scalar, ok := jsonScalar(value); ok {
+		return scalar
+	}
+	return sanitizeField(key, jsonValue(value), opts, limit)
+}
+
+// cleanBytes is a []byte sanitized as a string when it is valid UTF-8. Otherwise it is still
+// redacted, since bytes that are not valid UTF-8 as a whole can hold readable text (Latin-1, a
+// multi-byte character cut in two), and then cut to limit bytes. Redaction replaces only what its
+// rules match and leaves every other byte exactly as it was.
+func cleanBytes(value []byte, limit int, redactSecrets bool) []byte {
+	if value == nil {
+		return nil
+	}
+	if utf8.Valid(value) {
+		return []byte(CleanString(string(value), limit, redactSecrets))
+	}
+	text := string(value)
+	if redactSecrets {
+		text = redactBeforeCut(text, limit)
+	}
+	return []byte(text[:min(len(text), max(limit, 0))])
+}
+
+// CleanedValue is a value CleanValue sanitized. SanitizeMap and SanitizeSlice keep it as it is,
+// unless it is held under a field named for a credential, so its strings keep the limit CleanValue
+// was given rather than the caller's. Only CleanValue makes one.
+type CleanedValue struct {
+	value interface{}
+}
+
+// CleanValue returns v sanitized for a producer that sets its own string limit: v is converted as
+// SanitizeMap converts a value, and every string in it is redacted as RedactString redacts it and
+// cut to limit as CleanString cuts it. Field names are not judged, so a list of environment
+// variable names under `env_keys` keeps them; the producer must already have applied IsSecretField
+// and IsSecretFlag to every key and argument list that comes from data rather than from its own
+// types, as the endpoint inventory does for the MCP server definitions it captures. limit <= 0
+// uses DefaultStringLimit.
+func CleanValue(v interface{}, limit int) CleanedValue {
+	if limit <= 0 {
+		limit = DefaultStringLimit
+	}
+	return CleanedValue{value: cleanAll(v, limit)}
+}
+
+func cleanAll(value interface{}, limit int) interface{} {
+	switch typed := value.(type) {
+	case string:
+		return CleanString(typed, limit, true)
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(typed))
+		for key, item := range typed {
+			out[key] = cleanAll(item, limit)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(typed))
+		for index, item := range typed {
+			out[index] = cleanAll(item, limit)
+		}
+		return out
+	case []byte:
+		return cleanBytes(typed, limit, true)
+	case CleanedValue:
+		return cleanAll(typed.value, limit)
+	}
+	if scalar, ok := jsonScalar(value); ok {
+		return scalar
+	}
+	return cleanAll(jsonValue(value), limit)
+}
+
+// MarshalJSON writes the sanitized value.
+func (c CleanedValue) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.value)
+}
+
+// jsonScalar returns a value that holds no text, and true: nil, a boolean, or a number of one of
+// Go's number types, or a json.Number, kept as it is. A number JSON cannot write (a NaN, an
+// infinity, a json.Number that does not spell one) is nil.
+func jsonScalar(value interface{}) (interface{}, bool) {
+	switch typed := value.(type) {
+	case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return value, true
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) {
+			return nil, true
+		}
+		return value, true
+	case float32:
+		if math.IsNaN(float64(typed)) || math.IsInf(float64(typed), 0) {
+			return nil, true
+		}
+		return value, true
+	case json.Number:
+		// The encoder writes an empty json.Number as 0.
+		if typed != "" && !isJSONNumber(string(typed)) {
+			return nil, true
+		}
+		return value, true
+	}
+	return nil, false
+}
+
+// isJSONNumber reports whether s is a number as JSON spells it, which is what encoding/json
+// requires of a json.Number it writes.
+func isJSONNumber(s string) bool {
+	if s != "" && s[0] == '-' {
+		s = s[1:]
+	}
+	digits := func() bool {
+		n := 0
+		for n < len(s) && s[n] >= '0' && s[n] <= '9' {
+			n++
+		}
+		s = s[n:]
+		return n > 0
+	}
+	switch {
+	case s == "":
+		return false
+	case s[0] == '0':
+		s = s[1:]
+	case !digits():
+		return false
+	}
+	if s != "" && s[0] == '.' {
+		s = s[1:]
+		if !digits() {
+			return false
+		}
+	}
+	if s != "" && (s[0] == 'e' || s[0] == 'E') {
+		s = s[1:]
+		if s != "" && (s[0] == '+' || s[0] == '-') {
+			s = s[1:]
+		}
+		if !digits() {
+			return false
+		}
+	}
+	return s == ""
+}
+
+// redactAllStrings replaces every non-empty string in a slice held under a secret-named field,
+// at any depth of nested slices; maps inside it are sanitized by their own field names.
+func redactAllStrings(input []interface{}, opts PrivacyOptions) []interface{} {
+	out := make([]interface{}, len(input))
+	for index, value := range input {
+		out[index] = redactedItem(value, opts)
+	}
+	return out
+}
+
+// redactedItem is redactAllStrings' result for one item.
+func redactedItem(value interface{}, opts PrivacyOptions) interface{} {
+	switch typed := value.(type) {
+	case string:
+		if typed == "" {
+			return typed
+		}
+		return redactedValue
+	case []interface{}:
+		return redactAllStrings(typed, opts)
+	case map[string]interface{}:
+		return SanitizeMap(typed, opts)
+	case []byte:
+		if len(typed) == 0 {
+			return typed
+		}
+		return []byte(redactedValue)
+	case CleanedValue:
+		return redactedItem(typed.value, opts)
+	}
+	if scalar, ok := jsonScalar(value); ok {
+		return scalar
+	}
+	return redactedItem(jsonValue(value), opts)
+}
+
+// SanitizeSlice returns a sanitized copy of input, each item sanitized as SanitizeMap sanitizes a
+// value, and a string after a flag named for a secret (`["--api-key", "x"]`) redacted.
+func SanitizeSlice(input []interface{}, opts PrivacyOptions) []interface{} {
+	limit := opts.StringLimit
+	if limit <= 0 {
+		limit = DefaultStringLimit
+	}
+	out := make([]interface{}, len(input))
+	for index, value := range input {
+		out[index] = sanitizeItem(input, index, value, opts, limit)
+	}
+	return out
+}
+
+// sanitizeItem is SanitizeSlice's result for value, the item of input at index.
+func sanitizeItem(input []interface{}, index int, value interface{}, opts PrivacyOptions, limit int) interface{} {
+	switch typed := value.(type) {
+	case string:
+		// A flag named for a secret has its value in the next item: `["--api-key", "x"]`.
+		if opts.RedactSecrets && typed != "" && index > 0 && followsSecretFlag(input[index-1]) {
+			return redactedValue
+		}
+		return CleanString(typed, limit, opts.RedactSecrets)
+	case map[string]interface{}:
+		return SanitizeMap(typed, opts)
+	case []interface{}:
+		return SanitizeSlice(typed, opts)
+	case []byte:
+		if opts.RedactSecrets && len(typed) > 0 && index > 0 && followsSecretFlag(input[index-1]) {
+			return []byte(redactedValue)
+		}
+		return cleanBytes(typed, limit, opts.RedactSecrets)
+	case CleanedValue:
+		if opts.RedactSecrets && index > 0 && followsSecretFlag(input[index-1]) {
+			switch text := typed.value.(type) {
+			case string:
+				if text != "" {
+					return redactedValue
+				}
+			case []byte:
+				if len(text) > 0 {
+					return []byte(redactedValue)
+				}
+			}
+		}
+		return typed
+	}
+	if scalar, ok := jsonScalar(value); ok {
+		return scalar
+	}
+	return sanitizeItem(input, index, jsonValue(value), opts, limit)
+}
+
+// followsSecretFlag reports whether the item before a string is a flag named for a secret, read
+// as JSON writes it, so a named string type holding `--api-key` is one.
+func followsSecretFlag(previous interface{}) bool {
+	switch typed := previous.(type) {
+	case string:
+		return IsSecretFlag(typed)
+	case map[string]interface{}, []interface{}:
+		return false
+	case []byte:
+		return IsSecretFlag(string(typed))
+	case CleanedValue:
+		return followsSecretFlag(typed.value)
+	}
+	if _, scalar := jsonScalar(previous); scalar {
+		return false
+	}
+	return followsSecretFlag(jsonValue(previous))
+}
+
+// EventSanitizeOptions are the choices a writer makes about how SanitizeEventWith treats an event.
+type EventSanitizeOptions struct {
+	// RedactSecrets replaces credentials in every sanitized string. The collector exporter makes it
+	// configurable (redact_secrets); every other writer redacts.
+	RedactSecrets bool
+	// GenAIOutputLimit, when positive, is the string limit for gen_ai.output in place of the
+	// raw-attribute limit the rest of gen_ai keeps. The exporter raises it for a browser chat answer,
+	// which is what that event is about.
+	GenAIOutputLimit int
+}
+
+// SanitizeEvent is SanitizeEventWith with secret redaction on and the default limits, which is what
+// every writer but the collector exporter uses.
+func SanitizeEvent(event Event, maxBytes int) Event {
+	return SanitizeEventWith(event, maxBytes, EventSanitizeOptions{RedactSecrets: true})
+}
+
+// SanitizeEventWith caps and redacts an event's strings for the runtime log and sets field_truncated
+// when the result would still not fit in maxBytes.
+func SanitizeEventWith(event Event, maxBytes int, opts EventSanitizeOptions) Event {
+	redact := opts.RedactSecrets
+	event.Message = CleanString(event.Message, DefaultStringLimit, redact)
+	if event.Tool != nil {
+		event.Tool.Command = CleanString(event.Tool.Command, DefaultStringLimit, redact)
+		event.Tool.Path = TruncateString(event.Tool.Path, DefaultRawStringLimit)
+	}
+	if event.Command != nil {
+		event.Command.Command = CleanString(event.Command.Command, DefaultStringLimit, redact)
+		event.Command.Output = CleanString(event.Command.Output, DefaultStringLimit, redact)
+	}
+	// Retained content the writers have always emitted but this function never
+	// saw, because the struct did not declare the fields. A diff or a block of
+	// command output is exactly the kind of text that carries a credential, so
+	// these get the same limit and the same secret redaction as prompt.text
+	// rather than a weaker one.
+	if event.File != nil {
+		event.File.Diff = CleanString(event.File.Diff, DefaultStringLimit, redact)
+	}
+	if event.Approval != nil {
+		event.Approval.Reason = CleanString(event.Approval.Reason, DefaultStringLimit, redact)
+	}
+	if event.Policy != nil {
+		event.Policy.Reason = CleanString(event.Policy.Reason, DefaultStringLimit, redact)
+	}
+	if event.Prompt != nil {
+		event.Prompt.Text = CleanString(event.Prompt.Text, DefaultStringLimit, redact)
+	}
+	// The run, vcs and top-level model, repository and branch strings come from the environment, a
+	// runtime's attributes or the repository's own refs (a pull request names its branch), so they
+	// get the raw-attribute limit and secret redaction too.
+	metadata := PrivacyOptions{RedactSecrets: redact, StringLimit: DefaultRawStringLimit}
+	event.Run = SanitizeRun(event.Run, metadata)
+	event.VCS = SanitizeVCS(event.VCS, metadata)
+	event.Model = CleanString(event.Model, DefaultRawStringLimit, redact)
+	event.Repository = CleanString(event.Repository, DefaultRawStringLimit, redact)
+	event.Branch = CleanString(event.Branch, DefaultRawStringLimit, redact)
+	if event.MCP != nil {
+		event.MCP = SanitizeMCP(event.MCP, metadata)
+	}
+	if event.SystemContext != nil {
+		event.SystemContext = sanitizeSystemContext(event.SystemContext, metadata)
+	}
+	if event.GenAI != nil {
+		output := event.GenAI.Output
+		event.GenAI = SanitizeGenAI(event.GenAI, metadata)
+		if opts.GenAIOutputLimit > 0 && output != nil {
+			answer := PrivacyOptions{RedactSecrets: redact, StringLimit: opts.GenAIOutputLimit}
+			event.GenAI.Output = SanitizeGenAI(&GenAIInfo{Output: output}, answer).Output
+		}
+	}
+	if event.Raw != nil {
+		event.Raw = SanitizeMap(event.Raw, metadata)
+	}
+	// Marshaling the event only to measure it was a third of SanitizeEvent's cost. A bound on its
+	// size decides most events without it; a marshal that fails leaves Truncated as it was.
+	if n, ok := jsonSizeBound(&event, maxBytes); !ok || n > maxBytes {
+		if data, err := json.Marshal(event); err == nil && len(data) > maxBytes {
+			event.Truncated = true
+		}
+	}
+	return event
+}

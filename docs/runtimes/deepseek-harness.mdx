@@ -1,0 +1,341 @@
+---
+title: "DeepSeek Harness"
+description: "Beacon support details for DeepSeek Harness (dsh) endpoint telemetry"
+---
+
+## Runtime overview
+
+Beacon supports DeepSeek Harness — DeepSeek's open agent harness, run as `dsh` — through the Claude Code hook bridge DeepSeek publishes for every `dsh` release, sent to `beacon-hooks`, plus a local poll of DeepSeek's native session files.
+
+```bash
+beacon endpoint hooks install --harness dsh
+```
+
+`--harness deepseek-harness` and `--harness deepseek_harness` are also accepted, and all three install the same thing.
+
+DeepSeek Harness is composed rather than configured: every capability is a plugin, and the CLI, Web, ACP, and SDK surfaces are four compositions of one harness booting from one Harness home. There is one integration rather than one per surface, and one harness name — `deepseek_harness` — rather than a name per surface.
+
+<Note>
+**`dsh` does not read a hooks file until something mounts a reader at it.** That reader is `@deepseek-ai/dsh-hooks-claude-code`, which is not in the default plugin tree, so there is no convention that picks a hooks file up. That is why a Beacon install here is **two files**: the hooks file, and one row mounting the bridge at it.
+</Note>
+
+<Warning>
+**The bridge is not shipped with `dsh`.** It is only a development dependency of the `dsh` CLI, so a profile has it only when it has been [installed into that profile](#installing-the-hook-bridge), together with `@deepseek-ai/dsh-hook-protocol`, at exactly the `dsh` version. A mount `dsh` cannot load does not stop it from starting: the profile boots with `warning: 1 entry did not activate` and runs with no hooks. Beacon checks for a loadable bridge before it mounts one, and refuses rather than writing a mount that records nothing.
+</Warning>
+
+## Prerequisites
+
+Before enabling DeepSeek Harness telemetry, make sure:
+
+- `dsh` is installed and has been run at least once, so the Harness home exists.
+- The hook bridge is installed in the profiles you use, at your `dsh` version. See [Installing the hook bridge](#installing-the-hook-bridge). Session sync needs no bridge.
+- `beacon endpoint install` has run so shared endpoint config and runtime log paths exist.
+- `dsh` is restarted after hook install or removal, unless your profile enables HMR — the config watcher picks the patch layer up live, and without it the plugin tree is read at startup.
+
+## Collection path
+
+Beacon writes two files into the Harness home:
+
+| File | Owner | Purpose |
+|------|-------|---------|
+| `$DSH_HOME/beacon-endpoint-hooks.json` | Beacon, outright | The Claude Code hooks file — one command hook per event |
+| `$DSH_HOME/cordis.patch.yml` | **You** | Your patch layer. Beacon adds one row mounting the bridge at the file above |
+
+`$DSH_HOME` defaults to `~/.dsh`, and replaces it when set — matching how `dsh` resolves the Harness home itself.
+
+The row Beacon adds looks like this:
+
+```yaml
+# Beacon endpoint telemetry. Mounts DeepSeek's Claude Code hook bridge at
+# a hooks file Beacon owns. Local only: the hooks make no network calls.
+# Managed by `beacon endpoint hooks`; remove with `beacon endpoint hooks uninstall`.
+- insert:
+    - id: beacon-endpoint-hooks
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: '/home/you/.dsh/beacon-endpoint-hooks.json'
+```
+
+The home-level patch layer is applied over **every** profile and outranks each profile's own, so one install covers `dsh`, `dsh web`, the ACP server, and the SDK. `configPath` is absolute because the bridge resolves a relative path against the directory the process was launched from, which for an agent runtime is wherever you happened to be standing.
+
+### Installing the hook bridge
+
+The row names the bridge by package, and `dsh` resolves it from each profile's directory. Install it into every profile you run, with DeepSeek's own plugin manager, at exactly your `dsh` version:
+
+```bash
+dsh --version                       # for example 0.2.1-rc.2
+dsh plugin --profile web add \
+  @deepseek-ai/dsh-hooks-claude-code@0.2.1-rc.2 \
+  @deepseek-ai/dsh-hook-protocol@0.2.1-rc.2
+```
+
+Both packages are published for every `dsh` release and pin their `dsh` peers to it exactly, so a bridge for another version fails to load the same quiet way a missing one does. Upgrading `dsh` means installing the bridge again at the new version.
+
+Beacon never installs these packages itself. Before it writes the row, `beacon endpoint hooks install --harness dsh` checks, read-only, whether a matching bridge and protocol resolve:
+
+- from the `dsh` installation, for a release that ships the bridge;
+- from each profile under `$DSH_HOME/profiles`; or
+- through a row that already mounts a bridge **by absolute path** at Beacon's hooks file, in the home layer or a profile's own layer. This is how a declarative setup installs it, for example a Nix store path. Beacon treats it as installed, writes only the hooks file, and adds no row of its own (removing one an earlier install wrote), because a second mount would run every hook twice. A bridge mounted by path does not see the packages `dsh` ships, which `dsh` provides only to profile plugins, so its declared `@deepseek-ai/*` peers (`dsh-agent`, `dsh-llm`, `cordis` and the rest) and the protocol must resolve from where it sits, for example as `node_modules` links into the `dsh` installation. Without them `dsh` fails to import it with `Cannot find package '@deepseek-ai/dsh-llm'`, and Beacon reports the mount as `peers_missing` rather than installed.
+
+| What Beacon finds | `hooks install --harness dsh` | `hooks install --all`, `endpoint install` |
+|-------------------|-------------------------------|-------------------------------------------|
+| No route loads a matching bridge | Refuses, exits non-zero, writes nothing | Skips DeepSeek Harness with a warning; other runtimes install |
+| Some profiles have it, others do not | Installs, and names the profiles that will boot without hooks | Same |
+| A matching path mount | Writes the hooks file only | Same |
+
+Every refusal and warning gives the `dsh plugin --profile <name> add …` command at your version, and points at [`beacon endpoint dsh sync`](/cli/endpoint-dsh), which collects sessions from the session store with no bridge at all.
+
+The `dsh` version is read from the installation the `dsh` on `PATH` launches, following wrapper scripts, and from `dsh --version` when the installation cannot be found that way.
+
+Beacon also reads committed native session records from `$DSH_HOME/sessions` through:
+
+```bash
+beacon endpoint dsh sync
+beacon endpoint dsh status
+```
+
+The poll path is local and offline. It complements hooks by backfilling persisted assistant text, reasoning, structured tool failures, and token usage that the hook bridge does not expose. Poll events are marked `harness.collection_method=poll`, so they are historical observation only: they cannot approve, deny, hold, or delay a tool call.
+
+### Reading the session store
+
+DeepSeek Harness writes each session as `session.v4.jsonl.zstd` (session format v4, unchanged through 0.2.1-rc.2). Beacon reads it as follows:
+
+- **Tool calls.** A `tool/call` record stores `arguments` as the raw JSON string the model produced. Beacon decodes it, so commands, paths, patterns and edit text reach their fields.
+- **Tool results.** A `tool/result` carries the model-facing result message: the call id as `message.toolCallId`, the output as content blocks, and the failure flag as `message.isError`, with the failure's name and code beside it under `error`. Beacon joins each result to its call and records `command.executed`, `file.read`, `file.modified`, `mcp.tool_invoked`, `tool.completed` or `tool.failed`.
+- **`run_code` dispatches.** Tools a `run_code` program calls are logged as `tool/ptc-dispatch-start` and `tool/ptc-dispatch`, keyed by `subCallId`. Each becomes its own invocation and result, so a nested `bash` call is a `command.executed` with its command line.
+- **Prompts.** Every user-role message the model sees is a `user/message`, and only the ones with `source.kind: user` are something a person sent. Agent instructions, time and runtime snapshots, skill catalogs, messages relayed from other agents, job and subagent notices, goal continuations and compaction checkpoints are context DSH injected, and are not recorded as `prompt.submitted`.
+- **Compaction.** History compaction rewrites earlier messages in place (a `replace` surface operation). A pruned tool result is the same call's result again, so Beacon records each call's result once. The tokens of the summarizing model call (`compaction/summary`) are recorded as `token.usage` with `raw.dsh.token_source=compaction_summary`.
+- **Forks.** A forked session begins with a copy of its parent's history, closed by a `session/end-seed` record with `inherited: true`. That history was already collected under the parent, so Beacon reads it for context only and records the fork's own activity from the marker on.
+- **Session header.** The working directory, parent session and subagent origin come from the header line, which keeps its fields at the top level rather than under `data`. Every event carries the working directory, and `--workspace` filters on it.
+
+Records Beacon does not map are left out deliberately: retried or failed model attempts that committed no message (`assistant/attempt`, `llm/retry`), slash commands (`command/run`), team, goal, plan-mode and title bookkeeping, and subagent descriptors. They remain in DSH's own store.
+
+### Live hooks and the DeepSeek Harness sandbox
+
+<Warning>
+**In every sandbox mode except `danger-full-access`, live hooks cannot write Beacon's runtime log.** `dsh` runs hook commands inside the same sandbox as the session, confined to the session's working directory. Its sandbox policy is a mode plus a workspace root, with no list of extra writable paths, so a hook cannot reach `~/.beacon/endpoint/logs/runtime.jsonl` or any other path outside the workspace. The default mode is `read-only`, and `workspace-write` is the common working mode, so this is the usual case rather than an unusual one.
+</Warning>
+
+When this happens, each hook still exits `0`. That is deliberate: on this hook contract, exit code `2` is a **block**. It would refuse the tool call, erase the prompt, or stop a turn from ending, on every event, for as long as the log stays unwritable, and a telemetry write that failed must never become a control decision.
+
+What the hook does next depends on the sandbox mode:
+
+- **`workspace-write`: the event is staged in the workspace.** The hook writes it to the [workspace spool](/cli/endpoint-spool) in `<workspace>/.beacon/spool/deepseek_harness/<session>/` — the one path both sides can reach: the sandbox confines hook writes to the session's working directory, and `beacon endpoint dsh sync` runs outside the harness. Spools an earlier hook left in `<workspace>/.beacon/dsh-spool/<session>/` are still drained. The spool is readable only by your account wherever the workspace lives, and is capped at 8 MiB per session; an event that does not fit is reported as not recorded. Staging is silent on stderr (one process per event, so a note here would be a note on every event); the staged state shows up as `spool_bytes` in `beacon endpoint dsh status` instead. On first spool use in a repository, the hook also adds the directory to `.git/info/exclude` — the local, unshared ignore file, never `.gitignore` — so it stays out of `git status`. A linked worktree (where `.git` is a file) is left without the entry.
+- **`read-only` (the default): nothing is writable, including the workspace.** The spool write fails too. The hook then prints on stderr that the event was **not recorded**, names the log path and the error, and points at the remedies. The explanation is printed once per hook invocation, not once per event, so it stays readable wherever `dsh` shows or logs hook output.
+
+The poll half is unaffected. `beacon endpoint dsh sync` runs outside the harness and reads DeepSeek's own session store, so sessions the hooks missed can still be backfilled with assistant text, tool calls, commands, file activity, and token usage. What is lost without live capture is immediacy: poll events arrive after the fact, carry `harness.collection_method=poll`, and cannot hold or deny a tool call. Drained spool events are the opposite: they were captured live and keep `harness.collection_method=hook` when the sweep appends them, so they count as live capture everywhere it is measured.
+
+`beacon endpoint doctor` reports this as `dsh_hook_capture: warn` when DeepSeek sessions have run since the hooks were installed but no live hook event has been recorded. Sessions whose events are staged but not yet swept get their own evidence, `dsh_spool_pending_drain`: capture is working, the sweep has not run yet. The regular `harness_observed` check cannot catch either state, because synced poll events satisfy it. See [`dsh_hook_capture`](/cli/endpoint-doctor#dsh_hook_capture).
+
+Your options:
+
+- **Rely on the poll path.** Keep the sandbox and run `beacon endpoint dsh sync`, or ask `dsh` to run it through the Beacon skill. You get everything the store holds, without live capture or the policy seam.
+- **Run in `workspace-write` and sweep on a schedule.** Hooks capture live and stage into the workspace spool; a scheduled `beacon endpoint dsh sync` (or `--watch`) drains staged events into the runtime log as hook events. Until the sweep runs they are counted in `dsh status` as `spool_bytes`, not in the log.
+- **Run `dsh` in `danger-full-access` mode** for sessions that need direct live capture. This removes the sandbox for the whole session, not just for the hooks, so it is a security decision to make on its own merits. Beacon does not change the sandbox mode for you.
+
+The spool is the runtime-log-adjacent location a sandboxed hook can write: the session's own workspace, which changes from session to session and is usually a repository. That is why it holds nothing but telemetry, is emptied on every sweep, and is kept out of `git status` through `.git/info/exclude` rather than by touching the repository's `.gitignore`. The agent in the session can write there too, so the sweep treats the spool as untrusted input: it appends only DeepSeek Harness hook events of that session and refuses actions only Beacon writes, such as `session.share_requested`.
+
+<Warning>
+**There is no project scope.** The bridge's `configPath` is process-level — read once at startup — and per-session discovery of a project-local hooks file is unimplemented in the bridge itself. A repository has nowhere to mount a hook bridge from, so `--level project` is **refused with that explanation** rather than quietly becoming a machine-wide install. DeepSeek Harness is also left out of the project-level `--all` sweep for the same reason.
+</Warning>
+
+### Beacon edits your patch file as a document
+
+`cordis.patch.yml` is yours. It carries your comments, your quoting, and `!!js` expressions the loader evaluates at boot — so Beacon parses it into a YAML node tree, appends or removes **one self-contained element**, and re-encodes from the same tree. Comments, scalar style, and custom tags survive that round trip, and a test pins it.
+
+A self-contained element rather than a row pushed into one of your existing `insert:` lists, so an uninstall removes exactly what an install added.
+
+Beacon **refuses** rather than rewriting:
+
+- a patch file it cannot parse — unlike the hooks file, which it will replace, because this is where your whole plugin tree is tweaked and `dsh`'s parser is not Go's;
+- a patch file that is not a list of entries;
+- an `insert` element carrying Beacon's row alongside rows it did not write.
+
+<Warning>
+**An empty patch file does not boot `dsh`.** A present-but-empty or comments-only `cordis.patch.yml` fails startup — it is not ignored and it is not a warning. So an uninstall that would leave the file empty **removes the file** instead of truncating it. An absent patch layer is skipped cleanly.
+</Warning>
+
+### Registered events
+
+The bridge supports seven of Claude Code's hook events. Beacon registers all seven — there is nothing to leave out, because config for the other 23 is discarded before the bridge's parser sees it.
+
+| Event | Adapter subcommand | Timeout |
+|-------|--------------------|---------|
+| `SessionStart` | `session-start` | 10 s |
+| `UserPromptSubmit` | `prompt-submit` | 30 s |
+| `PreToolUse` | `pre-tool` | 10 s |
+| `PostToolUse` | `post-tool` | 10 s |
+| `Stop` | `stop` | 45 s |
+| `SubagentStart` | `subagent-start` | 10 s |
+| `SubagentStop` | `subagent-stop` | 10 s |
+
+Timeouts are **seconds**, matching Claude Code — the bridge reads `timeout` as `timeoutSec`. Its own default is 600 seconds, which is a very long time to hold an agent turn for a hook that finishes in milliseconds; Beacon writes explicit lower values as ceilings on a hang, not budgets.
+
+Beacon's hooks carry no `matcher`. An absent matcher is the match-all form in this dialect, which is what a telemetry hook wants on all seven — and the bridge validates a written matcher at parse time and rejects the **whole config** on a bad one, so the value that needs no validating is the safer one to write.
+
+## Discovery and status
+
+```bash title="Show DeepSeek Harness hook status"
+beacon endpoint hooks status --harness dsh
+```
+
+Status reports **both** paths, because `installed` is the conjunction of the two files: a hooks file with nothing mounted at it is a file nothing reads, and a mount pointing at a missing hooks file is a bridge that logs a warning and registers nothing. `beacon endpoint inventory` lists both for the same reason, so a half-install is visible as a half-install. A bridge mounted by path in a profile's own `cordis.patch.yml` counts as the mount, and inventory lists each profile's patch layer.
+
+Status also reports `active`: the files are in place **and** some route loads a bridge matching the running `dsh`. `--json` carries the detail under `bridge`: the `dsh` version, each profile with the bridge and protocol versions it resolves and a status (`ok`, `missing`, `protocol_missing`, `version_mismatch`, or `unverified` when the `dsh` version is unknown), and any path mounts, which can also be `peers_missing`. Discovery reports an installed but inactive integration as misconfigured, and `beacon endpoint doctor` explains it under [`dsh_hook_bridge`](/cli/endpoint-doctor#dsh_hook_bridge).
+
+DeepSeek Harness reports as the `deepseek_harness` harness with capability `hooks+session_log`. Live hook events carry `harness.collection_method=hook`; backfilled native session events carry `harness.collection_method=poll`. The bridge is a plugin, but it is DeepSeek's plugin, shipped and versioned with the CLI; what Beacon contributes is command hooks, and the thing that runs on each hook event is the same `beacon-hooks` binary every other hook runtime runs.
+
+## Install or configuration support
+
+```bash
+beacon endpoint hooks install --harness dsh
+beacon endpoint hooks status --harness dsh
+beacon endpoint hooks uninstall --harness dsh
+beacon endpoint dsh sync
+beacon endpoint dsh status
+```
+
+Re-running the install rewrites the hooks file wholesale, **repoints** the mount in place rather than adding a second one, and installs a Beacon-owned local skill at `$DSH_HOME/skills/beacon-endpoint/SKILL.md`. The skill only teaches `dsh` how to run `beacon endpoint dsh status` and workspace-scoped `beacon endpoint dsh sync`; it does not publish or upload anything.
+
+Uninstall removes Beacon's hooks file, its one patch element, and the Beacon-owned skill when its marker is still present. It leaves your rows, comments, and non-Beacon skills alone.
+
+## Telemetry coverage
+
+| Area | Support |
+|------|---------|
+| Runtime discovery | Supported through hook files and native session-store progress in the Harness home |
+| Harness attribution | Supported. `dsh`, `dsh_cli`, `dsh-cli`, `dshcli`, `deepseek_harness`, `deepseek-harness`, `deepseekharness`, `deepseek-ai/dsh`, and `@deepseek-ai/dsh` normalize to `deepseek_harness` |
+| Hook install, status, uninstall, and repair | Supported at user scope |
+| Session lifecycle | Supported. Hooks record `session.started` from `SessionStart`, and poll backfill records persisted session starts |
+| Prompts | Supported. Hooks record `prompt.submitted` from `UserPromptSubmit`; poll backfill reads the persisted messages a person sent, not the context DSH injects |
+| Assistant text and reasoning | Supported through native session poll |
+| Tool use | Supported for hook pre-tool/post-tool activity and persisted poll tool calls/results, including the tools a `run_code` program dispatches, with native call ids promoted to `gen_ai.tool.call.id` |
+| Commands | Supported. Hooks and poll both record `command.executed` with the command, output, and exit code when exposed |
+| File activity | Supported. Hooks and poll record `file.read` and `file.modified` with paths, operations, and diffs where available |
+| MCP activity | Supported. Recognized from `mcp__<server>__<tool>`, with the server and tool split out |
+| Subagents | Supported. `subagent.started` and `subagent.stopped` |
+| Approval decisions | Not collected. See [Known gaps](#known-gaps) |
+| Token usage and cost | Token usage is collected from native session poll when persisted, including the model calls that compact history. Runtime-reported cost is not currently exposed |
+| Failed tools | Collected from native session poll. Not exposed on the hook bridge |
+| Local JSONL and dashboard | Supported |
+| MDM deployment | Supported for the endpoint agent. Hooks are installed in the logged-in user's Harness home |
+
+### Tool taxonomy
+
+`dsh` publishes a generated tool catalog with both names and full argument schemas, so classification is backed by schemas rather than inferred from names, and is exhaustive over what the catalog lists:
+
+| Tool | Recorded as |
+|------|-------------|
+| `read`, `read_image`, `glob`, `grep` | `file.read` |
+| `write` | `file.modified`, operation `create` |
+| `edit` | `file.modified`, operation `modify` |
+| `str_replace_editor` | `file.read` or `file.modified`, per its `command` argument |
+| `bash`, `pwsh` | `command.executed`, with `command.output` and `command.exit_code` |
+| `terminal_send` | `command.executed`, with the submitted `text` as the command |
+| `mcp__<server>__<tool>` | `mcp.tool_invoked`, with `mcp.server` and `mcp.tool` |
+| `run_code`, `terminal_read`, `terminal_list`, `job_*`, `subagent`, `skill`, `workflow`, and the rest | `tool.invoked` |
+
+Four entries in that table are there because the generic classifier every runtime shares gets them wrong. `write` and `edit` — the two most common write tools — contain none of the words it looks for. `terminal_read` and `terminal_list` contain "terminal", which it reads as shell execution; both read retained output or enumerate sessions, and neither runs anything.
+
+### `terminal_send` names its command line `text`
+
+`dsh` runs commands through a persistent terminal as well as through `bash`, and that tool's payload is `text`, not `command`. Beacon reads it, so a command run through a terminal session carries a command line rather than being an empty `command.executed` invisible to every rule matching on `command.command`.
+
+A call with `submit: false` is still read. It carries control characters or an incomplete REPL line rather than a whole command, so what is recorded is a *fragment* of shell input — worth knowing, and better than letting "send the command in two writes" be a way to run commands Beacon does not record.
+
+### `run_code` is a tool call, not a command
+
+`run_code` executes a TypeScript program against the other tools and is the one tool that can ask for `danger-full-access`. Beacon records it as `tool.invoked`, for two reasons.
+
+A program's nested tool calls are **not invisible**: `dsh` dispatches them back through the complete guarded tool pipeline, which is the same seam the hook bridge listens on. So `await tools.bash({command: '...'})` inside a program fires its own `PreToolUse` and `PostToolUse` and is recorded as a command execution with a real command line. Classifying the outer wrapper as a command too would double-count it.
+
+And `command.command` is a *shell* command line — every threat rule that reads it is written in shell terms. A TypeScript program in that field would match those rules on its comments and string literals while matching none of them on what it does, and it would do so *instead of* the precise nested events.
+
+The program text is not lost: it is retained under `raw.dsh.tool_input.code`, redacted and size-limited like every other field.
+
+### Exit codes come from the output text
+
+The bridge flattens a tool result to text before a hook sees it, so `tool_response` is a plain string rather than an object. `dsh`'s `bash` and `pwsh` tools report a non-zero exit as `[exit code: N]` in that text, and that marker is the only place an exit code reaches a hook.
+
+Beacon reads the **last** marker in the output: everything above it is the command's own, and a command that prints something looking like the marker — a test asserting on one, a log line quoting one — would otherwise decide the event's exit code.
+
+A non-zero exit is recorded as `command.executed` with `command.exit_code`, not as a tool failure. A failing test run is an ordinary outcome of a command that ran.
+
+<Note>
+**`command` on `str_replace_editor` is not a shell command.** That tool multiplexes `view`, `create`, `str_replace`, and `insert` onto a `command` argument, and `command` is also what `bash` and `pwsh` call their command line. Beacon guards on the tool name, so an editor operation is never recorded under `command.command` and a real shell command is never dropped. `view` is the case that matters most: same tool, same arguments as the three writes, and only that word separates looking from creating.
+</Note>
+
+## Approvals and enforcement
+
+**Beacon records no approval decisions for DeepSeek Harness, and does not synthesize any.**
+
+The bridge supports seven events and `PermissionRequest` is not among them, so there is no approval decision anywhere on this runtime's hook surface. `PreToolUse` announces a call the agent is about to make, not a question anybody was asked. This is the same call already settled for [Cline](/runtimes/cline), [Pi](/runtimes/pi), [OpenHands](/runtimes/openhands), [Kiro](/runtimes/kiro), and [fx](/runtimes/vercel-fx).
+
+Beacon's observing hooks answer with an empty JSON object, which the bridge's decoder reads as no opinion. They deliberately do **not** answer `allow`: on this runtime that is a real pre-approval, so an observing hook answering it would be disarming your permission gate for every tool call rather than watching it.
+
+Enforcement stays behind the optional, off-by-default policy provider seam (`BEACON_POLICY_PROVIDER`), which is inert unless it names an executable and fails open on any error. DeepSeek Harness is one of the runtimes where a provider deny takes effect, using Claude Code's deny shape — which is the shape the bridge's decoder reads:
+
+```json
+{"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": "..."}}
+```
+
+`hookEventName` must equal the firing event or the bridge discards the whole block; it passes the event name in as a guard precisely to stop a hook answering for an event that is not running.
+
+## Data handling
+
+DeepSeek Harness content is handled like every other runtime. Prompts, assistant text/reasoning from poll, tool arguments, commands, command output, paths, and diffs are retained in local or customer-controlled logs, with local secret redaction and per-string limits applied before writing, and a hash and byte count on each content-bearing event. Events over the 64 KiB limit drop raw and retained content, preserve stable metadata, and set `field_truncated`.
+
+Unlike [Kiro](/runtimes/kiro) and [OpenHands](/runtimes/openhands), Beacon **does** preserve the verbatim payload under `raw.dsh`, as it does for [Qwen Code](/runtimes/qwen-code) and [Muse Code](/runtimes/muse-code). Non-MCP tool arguments reach no endpoint-schema field on any runtime, so on `dsh` this is where `run_code`'s program, a `glob` or `grep` pattern, a `terminal_send` `submit` flag, and `SessionStart`'s `source` survive. The cost is stated rather than hidden: on a `write` the payload repeats the file content the diff already carries. `raw` is the first thing dropped at the size ceiling, so the duplication is bounded and the diff is what survives.
+
+## Known gaps
+
+- **No approval decisions.** The bridge exposes no `PermissionRequest` event, native session records do not represent operator decisions, and Beacon does not synthesize one from `PreToolUse`. Approval rules and dashboards will show nothing for this runtime.
+- **Token usage is poll-only.** The bridge builds each hook payload from a fixed base plus per-event fields, and no usage count is among them on any of the seven events. `beacon endpoint dsh sync` reads usage from native session records when DeepSeek persisted it.
+- **Failed tools are poll-only.** The bridge hands a hook the result's flattened text and nothing else, so a tool that threw is indistinguishable at the hook from one that returned. Native session poll records failed tool results when the session store marks them. A non-zero shell exit is *not* a tool failure and is recorded as a command exit code.
+- **No session-end event.** `dsh` has no `SessionEnd`. `Stop` fires when a turn finishes, not when a session ends, so it is recorded as `tool.completed`.
+- **No transcript path on hooks.** The bridge always sends `transcript_path` as the empty string. Use `beacon endpoint dsh sync` for the native session-store path.
+- **No compaction events.** `PreCompact` and `PostCompact` are among the events the bridge does not support.
+- **Subagent detail is thin.** The bridge reports a constant `agent_type` of `general-purpose` and uses the child's session id where Claude Code reports the parent's, so a subagent event cannot be joined to the session that spawned it.
+- **Live capture needs a writable workspace, or `danger-full-access` for a direct write.** In `workspace-write`, hooks stage events in the session workspace and `beacon endpoint dsh sync` drains them into the runtime log — staged events are not in the log until a sweep runs. In `read-only` (the default) nothing is writable, so hooks record nothing and sync from DeepSeek's session store is the collection path. Only `danger-full-access` writes the runtime log directly. See [Live hooks and the DeepSeek Harness sandbox](#live-hooks-and-the-deepseek-harness-sandbox).
+- **No project scope.** See the warning under [Collection path](#collection-path).
+- **Only command hooks run.** The bridge runs shell-form `command` handlers only, which is what Beacon writes. It has no bearing on Beacon's install and is noted because it bounds what else you can put in the same file.
+
+## Deployment notes
+
+The plugin tree is read at startup unless your profile enables HMR, so an install taken while `dsh` is running takes effect on the next start. The install prints that reminder.
+
+Confirm status, then generate one event and check the log:
+
+```bash
+beacon endpoint hooks status --harness dsh
+beacon endpoint dsh status
+beacon endpoint dsh sync
+beacon endpoint doctor
+grep '"name":"deepseek_harness"' ~/.beacon/endpoint/logs/runtime.jsonl | tail -3
+```
+
+If DeepSeek Harness telemetry is missing:
+
+- Run `beacon endpoint doctor`. If it reports `dsh_hook_bridge: warn`, `dsh` cannot load the bridge, or some profiles cannot: it names the `dsh` and bridge versions and the command that installs a matching bridge. The startup line `warning: 1 entry did not activate` with `Cannot find package '@deepseek-ai/dsh-hooks-claude-code'` (or `dsh-hook-protocol`) is the same problem seen from `dsh`. See [Installing the hook bridge](#installing-the-hook-bridge).
+- Run `beacon endpoint doctor`. If it reports `dsh_hook_capture: warn`, the hooks are loaded but cannot write the log, which is almost always the session sandbox. See [Live hooks and the DeepSeek Harness sandbox](#live-hooks-and-the-deepseek-harness-sandbox). Hook stderr, and `dsh`'s own hook output, will show `beacon-hooks: this event was NOT recorded`.
+- Confirm **both** files exist. `beacon endpoint hooks status --harness dsh` prints both paths; either one alone is inert.
+- Check `$DSH_HOME`: if it is set, both files are under that directory, not `~/.dsh`.
+- Confirm the mount's `configPath` points at the hooks file that is actually there. A reinstall repoints it.
+- Confirm the hooks file contains commands with `--platform dsh`.
+- Preview the composed configuration with `dsh --dump-config` to confirm the bridge row is in the tree the profile mounts.
+- Check the startup log under `$DSH_HOME/logs/` for a `hooks-claude-code` warning. A config the bridge cannot read registers **no** hooks and says so only there.
+- Restart `dsh` so the updated plugin tree is loaded.
+- Run `beacon endpoint dsh status` to see whether native session records are pending backfill.
+
+## Related
+
+<Columns cols={2}>
+  <Card title="beacon endpoint dsh" icon="rotate" href="/cli/endpoint-dsh">
+    Sync committed sessions and inspect collection progress.
+  </Card>
+  <Card title="Agent harness integration model" icon="plug" href="/runtimes/integration-model">
+    See how Beacon discovers and configures each runtime.
+  </Card>
+</Columns>

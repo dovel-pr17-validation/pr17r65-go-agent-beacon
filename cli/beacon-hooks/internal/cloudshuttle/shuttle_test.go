@@ -1,0 +1,543 @@
+package cloudshuttle
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func useSandbox(t *testing.T, dir string) {
+	t.Helper()
+	prev := SandboxDir
+	SandboxDir = dir
+	t.Cleanup(func() { SandboxDir = prev })
+}
+
+func TestResetFromEnvPreservesLockFiles(t *testing.T) {
+	dir := t.TempDir()
+	useSandbox(t, dir)
+	logPath := filepath.Join(dir, "runtime.jsonl")
+	statePath := filepath.Join(dir, "state.json")
+	for _, path := range []string{logPath, logPath + ".lock", statePath} {
+		if err := os.WriteFile(path, []byte("x"), 0644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	t.Setenv("BEACON_ORIGIN", "cloud")
+	t.Setenv("BEACON_ENDPOINT_LOG", logPath)
+	t.Setenv("BEACON_CLOUD_SHUTTLE_STATE", statePath)
+
+	if err := ResetFromEnv(); err != nil {
+		t.Fatalf("ResetFromEnv returned error: %v", err)
+	}
+	for _, path := range []string{logPath, statePath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("%s still exists, stat err=%v", path, err)
+		}
+	}
+	if _, err := os.Stat(logPath + ".lock"); err != nil {
+		t.Fatalf("runtime lock must retain its stable identity: %v", err)
+	}
+}
+
+// Stop and SessionEnd call MaybeUpload whenever BEACON_CLOUD_* is set. Without the cloud
+// sandbox marker those variables must not open a network connection.
+func TestMaybeUploadWithoutCloudOriginSendsNothing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected upload without BEACON_ORIGIN=cloud: %s %s", r.Method, r.URL)
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	useSandbox(t, dir)
+	logPath := filepath.Join(dir, "runtime.jsonl")
+	if err := os.WriteFile(logPath, []byte("{\"event\":\"session\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEACON_ORIGIN", "")
+	t.Setenv("BEACON_CLOUD_UPLOAD", "s3")
+	t.Setenv("BEACON_CLOUD_S3_BUCKET", "bucket")
+	t.Setenv("BEACON_CLOUD_S3_ENDPOINT", server.URL)
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIATEST")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	t.Setenv("BEACON_RUN_ID", "run")
+	t.Setenv("BEACON_ENDPOINT_LOG", logPath)
+	t.Setenv("BEACON_CLOUD_SHUTTLE_STATE", filepath.Join(dir, "state.json"))
+	if err := MaybeUpload(context.Background(), true); err != nil {
+		t.Fatalf("MaybeUpload returned error: %v", err)
+	}
+}
+
+// A target the environment supplies cannot select a log outside the sandbox directory, so a
+// repository cannot have a host's runtime log, every project's sessions, uploaded to its bucket.
+func TestMaybeUploadRefusesALogOutsideTheSandbox(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected upload: %s %s", r.Method, r.URL)
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	useSandbox(t, filepath.Join(dir, "sandbox"))
+	hostLog := filepath.Join(dir, "runtime.jsonl")
+	if err := os.WriteFile(hostLog, []byte("{\"event\":\"host\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEACON_ORIGIN", "cloud")
+	t.Setenv("BEACON_CLOUD_UPLOAD", "s3")
+	t.Setenv("BEACON_CLOUD_S3_BUCKET", "bucket")
+	t.Setenv("BEACON_CLOUD_S3_ENDPOINT", server.URL)
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIATEST")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	t.Setenv("BEACON_RUN_ID", "run")
+	t.Setenv("BEACON_CLOUD_SHUTTLE_STATE", filepath.Join(dir, "state.json"))
+	for _, key := range []string{"BEACON_CLOUD_LOG_PATH", "BEACON_ENDPOINT_LOG"} {
+		t.Setenv(key, hostLog)
+		if err := MaybeUpload(context.Background(), true); err != nil {
+			t.Fatalf("%s: MaybeUpload returned error: %v", key, err)
+		}
+		t.Setenv(key, "")
+	}
+}
+
+// A run with a bucket and a run id but no credentials is the shuttle half-configured, which every
+// Stop and SessionEnd reaches. It must do nothing: no request carrying the runtime log to the
+// storage endpoint unsigned, no error for the hook to log, and no state claiming an upload.
+func TestMaybeUploadWithoutCredentialsSendsNothing(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"s3 without keys": {
+			"BEACON_CLOUD_UPLOAD":    "s3",
+			"BEACON_CLOUD_S3_BUCKET": "bucket",
+			"AWS_ACCESS_KEY_ID":      "",
+			"AWS_SECRET_ACCESS_KEY":  "",
+		},
+		"gcs without credentials": {
+			"BEACON_CLOUD_UPLOAD":              "gcs",
+			"BEACON_CLOUD_GCS_BUCKET":          "bucket",
+			"BEACON_CLOUD_GCS_CREDENTIALS_B64": "",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Errorf("unexpected request without credentials: %s %s", r.Method, r.URL)
+			}))
+			defer server.Close()
+			dir := t.TempDir()
+			useSandbox(t, dir)
+			logPath := filepath.Join(dir, "runtime.jsonl")
+			if err := os.WriteFile(logPath, []byte("{\"event\":\"session\"}\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			statePath := filepath.Join(dir, "state.json")
+			t.Setenv("BEACON_ORIGIN", "cloud")
+			t.Setenv("BEACON_ENDPOINT_LOG", logPath)
+			t.Setenv("BEACON_CLOUD_SHUTTLE_STATE", statePath)
+			t.Setenv("BEACON_RUN_ID", "run")
+			t.Setenv("BEACON_CLOUD_S3_ENDPOINT", server.URL)
+			t.Setenv("BEACON_CLOUD_GCS_ENDPOINT", server.URL)
+			for key, value := range env {
+				t.Setenv(key, value)
+			}
+			if err := MaybeUpload(context.Background(), true); err != nil {
+				t.Fatalf("MaybeUpload returned error: %v", err)
+			}
+			if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+				t.Fatalf("state written without an upload, stat err=%v", err)
+			}
+		})
+	}
+}
+
+// Local installs set BEACON_ENDPOINT_LOG outside the sandbox, and every local SessionStart, Stop
+// and SessionEnd reads the shuttle config, so the refusal notice is for cloud runs only.
+func TestConfigFromEnvIsSilentOutsideCloud(t *testing.T) {
+	dir := t.TempDir()
+	useSandbox(t, filepath.Join(dir, "sandbox"))
+	t.Setenv("BEACON_ORIGIN", "")
+	t.Setenv("BEACON_ENDPOINT_LOG", filepath.Join(dir, "runtime.jsonl"))
+	t.Setenv("BEACON_CLOUD_SHUTTLE_STATE", filepath.Join(dir, "state.json"))
+	captured, err := os.CreateTemp(dir, "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer captured.Close()
+	prev := os.Stderr
+	os.Stderr = captured
+	cfg := ConfigFromEnv()
+	os.Stderr = prev
+	if cfg.LogPath != filepath.Join(SandboxDir, defaultLogName) {
+		t.Fatalf("LogPath = %q, want the sandbox default", cfg.LogPath)
+	}
+	if out, err := os.ReadFile(captured.Name()); err != nil || len(out) != 0 {
+		t.Fatalf("stderr = %q (err %v), want nothing", out, err)
+	}
+}
+
+func TestUploadSendsJSONLToGCS(t *testing.T) {
+	restore := stubNow(t, time.Date(2026, 7, 12, 20, 17, 3, 0, time.UTC))
+	defer restore()
+	key := mustRSAKey(t)
+	var uploadedPath, uploadedAuth, uploadedType, uploadedEncoding string
+	var uploadedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			if err := r.ParseForm(); err != nil {
+				t.Fatalf("parse form: %v", err)
+			}
+			if r.Form.Get("grant_type") != "urn:ietf:params:oauth:grant-type:jwt-bearer" || r.Form.Get("assertion") == "" {
+				t.Fatalf("unexpected token request: %s", r.Form.Encode())
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"access_token": "test-token", "token_type": "Bearer", "expires_in": 3600})
+		default:
+			uploadedPath = r.URL.EscapedPath()
+			uploadedAuth = r.Header.Get("Authorization")
+			uploadedType = r.Header.Get("Content-Type")
+			uploadedEncoding = r.Header.Get("Content-Encoding")
+			data, _ := io.ReadAll(r.Body)
+			uploadedBody = data
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
+	if err := os.WriteFile(logPath, []byte("{\"event\":\"ok\"}\n"), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	creds := serviceAccount{
+		ClientEmail: "beacon@example.iam.gserviceaccount.com",
+		PrivateKey:  pemKey(t, key),
+		TokenURI:    server.URL + "/token",
+	}
+	credsJSON, err := json.Marshal(creds)
+	if err != nil {
+		t.Fatalf("marshal creds: %v", err)
+	}
+	cfg := Config{
+		LogPath:        logPath,
+		StatePath:      filepath.Join(t.TempDir(), "state.json"),
+		Bucket:         "bucket",
+		Prefix:         "prefix",
+		CredentialsB64: base64.StdEncoding.EncodeToString(credsJSON),
+		Provider:       "claude_code_web",
+		UserID:         "user",
+		RunID:          "run",
+		GCSEndpoint:    server.URL,
+	}
+	if err := Upload(context.Background(), cfg, true); err != nil {
+		t.Fatalf("Upload returned error: %v", err)
+	}
+	if uploadedAuth != "Bearer test-token" {
+		t.Fatalf("Authorization = %q, want bearer token", uploadedAuth)
+	}
+	if uploadedType != contentTypeJSONL {
+		t.Fatalf("Content-Type = %q, want %q", uploadedType, contentTypeJSONL)
+	}
+	if uploadedEncoding != contentEncoding {
+		t.Fatalf("Content-Encoding = %q, want %q", uploadedEncoding, contentEncoding)
+	}
+	if !strings.Contains(uploadedPath, "/bucket/prefix/runtime/date=2026-07-12/1783887423-claude_code_web-run.jsonl.gz") {
+		t.Fatalf("upload path = %q", uploadedPath)
+	}
+	if got := gunzipString(t, uploadedBody); got != "{\"event\":\"ok\"}\n" {
+		t.Fatalf("uploaded body = %q", got)
+	}
+}
+
+func TestConfigFromEnvSelectsS3(t *testing.T) {
+	t.Setenv("BEACON_CLOUD_UPLOAD", "s3")
+	t.Setenv("BEACON_CLOUD_S3_BUCKET", "bucket")
+	t.Setenv("BEACON_CLOUD_S3_PREFIX", "prefix")
+	t.Setenv("BEACON_CLOUD_S3_REGION", "us-west-2")
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIATEST")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	t.Setenv("AWS_SESSION_TOKEN", "token")
+	t.Setenv("BEACON_RUN_ID", "run")
+
+	cfg := ConfigFromEnv()
+	if cfg.Upload != uploadS3 {
+		t.Fatalf("Upload = %q, want %q", cfg.Upload, uploadS3)
+	}
+	if cfg.Bucket != "bucket" || cfg.Prefix != "prefix" || cfg.S3Region != "us-west-2" {
+		t.Fatalf("unexpected S3 config: %#v", cfg)
+	}
+	if cfg.S3AccessKeyID != "AKIATEST" || cfg.S3SecretKey != "secret" || cfg.S3SessionToken != "token" {
+		t.Fatalf("unexpected S3 credentials in config: %#v", cfg)
+	}
+}
+
+func TestConfigFromEnvDefaultsToGCSWhenS3BucketIsAlsoSet(t *testing.T) {
+	t.Setenv("BEACON_CLOUD_UPLOAD", "")
+	t.Setenv("BEACON_CLOUD_GCS_BUCKET", "gcs-bucket")
+	t.Setenv("BEACON_CLOUD_GCS_PREFIX", "gcs-prefix")
+	t.Setenv("BEACON_CLOUD_GCS_CREDENTIALS_B64", "gcs-credentials")
+	t.Setenv("BEACON_CLOUD_S3_BUCKET", "s3-bucket")
+
+	cfg := ConfigFromEnv()
+	if cfg.Upload != uploadGCS {
+		t.Fatalf("Upload = %q, want %q", cfg.Upload, uploadGCS)
+	}
+	if cfg.Bucket != "gcs-bucket" || cfg.Prefix != "gcs-prefix" || cfg.CredentialsB64 != "gcs-credentials" {
+		t.Fatalf("unexpected GCS config: %#v", cfg)
+	}
+}
+
+func TestUploadSendsJSONLToS3(t *testing.T) {
+	restore := stubNow(t, time.Date(2026, 7, 12, 20, 17, 3, 0, time.UTC))
+	defer restore()
+	var uploadedPath, uploadedAuth, uploadedDate, uploadedHash, uploadedToken, uploadedType, uploadedEncoding string
+	var uploadedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploadedPath = r.URL.EscapedPath()
+		uploadedAuth = r.Header.Get("Authorization")
+		uploadedDate = r.Header.Get("X-Amz-Date")
+		uploadedHash = r.Header.Get("X-Amz-Content-Sha256")
+		uploadedToken = r.Header.Get("X-Amz-Security-Token")
+		uploadedType = r.Header.Get("Content-Type")
+		uploadedEncoding = r.Header.Get("Content-Encoding")
+		data, _ := io.ReadAll(r.Body)
+		uploadedBody = data
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	body := "{\"event\":\"ok\"}\n"
+	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
+	if err := os.WriteFile(logPath, []byte(body), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	cfg := Config{
+		Upload:         uploadS3,
+		LogPath:        logPath,
+		StatePath:      filepath.Join(t.TempDir(), "state.json"),
+		Bucket:         "bucket",
+		Prefix:         "prefix",
+		Provider:       "claude_code_web",
+		UserID:         "user",
+		RunID:          "run",
+		S3Region:       "us-west-2",
+		S3AccessKeyID:  "AKIATEST",
+		S3SecretKey:    "secret",
+		S3SessionToken: "session-token",
+		S3Endpoint:     server.URL,
+	}
+	if err := Upload(context.Background(), cfg, true); err != nil {
+		t.Fatalf("Upload returned error: %v", err)
+	}
+	if !strings.Contains(uploadedPath, "/bucket/prefix/runtime/date=2026-07-12/1783887423-claude_code_web-run.jsonl.gz") {
+		t.Fatalf("upload path = %q", uploadedPath)
+	}
+	if !strings.HasPrefix(uploadedAuth, "AWS4-HMAC-SHA256 Credential=AKIATEST/") {
+		t.Fatalf("Authorization = %q", uploadedAuth)
+	}
+	for _, want := range []string{"us-west-2/s3/aws4_request", "SignedHeaders=content-encoding;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token"} {
+		if !strings.Contains(uploadedAuth, want) {
+			t.Fatalf("Authorization missing %q: %q", want, uploadedAuth)
+		}
+	}
+	if uploadedDate == "" {
+		t.Fatal("X-Amz-Date is empty")
+	}
+	sum := sha256.Sum256(uploadedBody)
+	if uploadedHash != hex.EncodeToString(sum[:]) {
+		t.Fatalf("X-Amz-Content-Sha256 = %q", uploadedHash)
+	}
+	if uploadedToken != "session-token" {
+		t.Fatalf("X-Amz-Security-Token = %q", uploadedToken)
+	}
+	if uploadedType != contentTypeJSONL {
+		t.Fatalf("Content-Type = %q, want %q", uploadedType, contentTypeJSONL)
+	}
+	if uploadedEncoding != contentEncoding {
+		t.Fatalf("Content-Encoding = %q, want %q", uploadedEncoding, contentEncoding)
+	}
+	if got := gunzipString(t, uploadedBody); got != body {
+		t.Fatalf("uploaded body = %q", got)
+	}
+}
+
+func TestAWSCanonicalURIEncodesHivePartitionEquals(t *testing.T) {
+	got := awsCanonicalURI("/bucket/prefix/runtime/date=2026-07-12/1783891419-claude_code_web-cse_123.jsonl.gz")
+	want := "/bucket/prefix/runtime/date%3D2026-07-12/1783891419-claude_code_web-cse_123.jsonl.gz"
+	if got != want {
+		t.Fatalf("awsCanonicalURI = %q, want %q", got, want)
+	}
+}
+
+func TestUploadReusesLastObjectForSameRun(t *testing.T) {
+	current := time.Date(2026, 7, 12, 20, 17, 3, 0, time.UTC)
+	restore := stubNowFunc(t, func() time.Time { return current })
+	defer restore()
+	var uploadedPaths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploadedPaths = append(uploadedPaths, r.URL.EscapedPath())
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "runtime.jsonl")
+	if err := os.WriteFile(logPath, []byte("{\"event\":\"first\"}\n"), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	cfg := Config{
+		Upload:        uploadS3,
+		LogPath:       logPath,
+		StatePath:     filepath.Join(dir, "state.json"),
+		Bucket:        "bucket",
+		Prefix:        "prefix",
+		Provider:      "cursor_cloud",
+		RunID:         "run",
+		S3Region:      "us-west-2",
+		S3AccessKeyID: "AKIATEST",
+		S3SecretKey:   "secret",
+		S3Endpoint:    server.URL,
+	}
+	if err := Upload(context.Background(), cfg, true); err != nil {
+		t.Fatalf("first Upload returned error: %v", err)
+	}
+
+	current = current.Add(2 * time.Minute)
+	if err := os.WriteFile(logPath, []byte("{\"event\":\"second\"}\n"), 0644); err != nil {
+		t.Fatalf("rewrite log: %v", err)
+	}
+	if err := Upload(context.Background(), cfg, true); err != nil {
+		t.Fatalf("second Upload returned error: %v", err)
+	}
+
+	if len(uploadedPaths) != 2 {
+		t.Fatalf("uploaded paths = %v, want 2 uploads", uploadedPaths)
+	}
+	if uploadedPaths[0] != uploadedPaths[1] {
+		t.Fatalf("Upload used different object keys: first=%q second=%q", uploadedPaths[0], uploadedPaths[1])
+	}
+	want := "/bucket/prefix/runtime/date=2026-07-12/1783887423-cursor_cloud-run.jsonl.gz"
+	if uploadedPaths[0] != want {
+		t.Fatalf("upload path = %q, want %q", uploadedPaths[0], want)
+	}
+}
+
+func TestObjectNameStaysUnderPrefix(t *testing.T) {
+	when := time.Date(2026, 7, 12, 16, 17, 3, 0, time.UTC)
+	restore := stubNow(t, when)
+	defer restore()
+
+	got := ObjectName(Config{Prefix: "tenant/logs", Provider: "claude_code_web", RunID: "../../../../../outside"})
+	want := "tenant/logs/runtime/date=2026-07-12/1783873023-claude_code_web-.jsonl.gz"
+	if got != want {
+		t.Fatalf("ObjectName = %q, want %q", got, want)
+	}
+}
+
+func TestResolveRunIDUsesOnlyEnvironment(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_env")
+	if got := resolveRunID(); got != "cse_env" {
+		t.Fatalf("resolveRunID = %q, want cse_env", got)
+	}
+}
+
+func mustRSAKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 1024) // smallest size crypto/rsa accepts; keeps keygen fast
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	return key
+}
+
+func stubNow(t *testing.T, value time.Time) func() {
+	t.Helper()
+	return stubNowFunc(t, func() time.Time { return value.UTC() })
+}
+
+func stubNowFunc(t *testing.T, fn func() time.Time) func() {
+	t.Helper()
+	old := nowUTC
+	nowUTC = func() time.Time { return fn().UTC() }
+	return func() { nowUTC = old }
+}
+
+func gunzipString(t *testing.T, data []byte) string {
+	t.Helper()
+	reader, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	defer reader.Close()
+	out, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("gzip read: %v", err)
+	}
+	return string(out)
+}
+
+func pemKey(t *testing.T, key *rsa.PrivateKey) string {
+	t.Helper()
+	data, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: data}))
+}
+
+// A Cursor subagent reports a conversation id of its own, which becomes the run id of its hooks.
+// The agent and its subagent share one sandbox log, so they must keep rewriting one object.
+func TestUploadKeepsOneObjectWhenTheConversationChanges(t *testing.T) {
+	current := time.Date(2026, 11, 13, 21, 5, 36, 0, time.UTC)
+	restore := stubNowFunc(t, func() time.Time { return current })
+	defer restore()
+	var uploadedPaths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploadedPaths = append(uploadedPaths, r.URL.EscapedPath())
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "runtime.jsonl")
+	cfg := Config{
+		Upload:        uploadS3,
+		LogPath:       logPath,
+		StatePath:     filepath.Join(dir, "state.json"),
+		Bucket:        "bucket",
+		Prefix:        "prefix",
+		Provider:      "cursor_cloud",
+		RunID:         "bc-89723c38-a074-4c36-98cc-95e9da5f8dd3",
+		S3Region:      "us-west-2",
+		S3AccessKeyID: "AKIATEST",
+		S3SecretKey:   "secret",
+		S3Endpoint:    server.URL,
+	}
+	for i, runID := range []string{cfg.RunID, "bc-80383700-254c-5f11-8bff-de4e1cd943c0", cfg.RunID} {
+		appendLines(t, logPath, fmt.Sprintf(`{"event":%d}`, i))
+		next := cfg
+		next.RunID = runID
+		current = current.Add(time.Minute)
+		if err := Upload(context.Background(), next, true); err != nil {
+			t.Fatalf("Upload %d returned error: %v", i, err)
+		}
+	}
+	if len(uploadedPaths) != 3 {
+		t.Fatalf("uploaded paths = %v, want 3 uploads", uploadedPaths)
+	}
+	for _, p := range uploadedPaths[1:] {
+		if p != uploadedPaths[0] {
+			t.Fatalf("a subagent's upload started another object: %v", uploadedPaths)
+		}
+	}
+}

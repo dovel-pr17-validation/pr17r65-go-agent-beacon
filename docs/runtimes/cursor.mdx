@@ -1,0 +1,106 @@
+---
+title: "Cursor"
+description: "Beacon support details for Cursor endpoint telemetry"
+---
+
+## Runtime overview
+
+Beacon supports Cursor through native hook payloads sent to `beacon-hooks`, with local session-store sync for historical backfill.
+For provider-managed Cursor cloud sessions, see
+[Cursor Cloud Agents](/runtimes/cursor-cloud-agents).
+
+While the Cursor desktop app shows a cloud agent, it also runs the hooks
+installed on your machine for that agent's reasoning and subagent events, but
+not for its prompts, tool calls, replies or turn ends, which happen in Cursor's
+VM. Beacon does not record those calls on the endpoint, so a cloud agent never
+appears as a partial local session. To record cloud agents, set up
+[Cursor Cloud Agents](/runtimes/cursor-cloud-agents). Beacon v1.3.60 and earlier
+recorded them as `agent.reasoning` and `subagent.stopped` events from your
+machine, under session ids that start with `bc-` or `task-call-`.
+
+## Prerequisites
+
+Before enabling Cursor hooks, make sure:
+
+- Cursor is installed for the user or the `~/.cursor` directory exists.
+- `beacon endpoint install` has run so shared endpoint config and runtime log paths exist.
+- Beacon hooks are installed, either by `beacon endpoint install` when it detects Cursor (or with `--harness cursor`) or with `beacon endpoint hooks install --harness cursor`.
+- For project-level collection, install hooks from the target project with `--level project`.
+- Cursor is restarted after hook install or removal so new sessions load the updated hook configuration.
+
+## Collection path
+
+Cursor invokes Beacon's hook adapter from Cursor hook configuration. The adapter writes normalized endpoint events to the configured runtime JSONL log.
+
+Beacon can also read Cursor's committed local session stores:
+
+```bash title="Sync Cursor local sessions"
+beacon endpoint cursor status
+beacon endpoint cursor sync
+```
+
+The sync path reads Cursor Composer conversations from the global VS Code storage database and agent transcripts under `~/.cursor/projects`. It is local and offline, emits events with `harness.collection_method=poll`, and is useful for historical sessions or sessions that ran before Beacon hooks were installed. Use `--print` to inspect mapped events without writing the runtime log or advancing the cursor.
+
+## Discovery and status
+
+Beacon detects Cursor through the Cursor binary or `~/.cursor`, then checks Beacon hook configuration.
+
+Use `beacon endpoint hooks status --harness cursor` to inspect Cursor hook status. Use `beacon endpoint cursor status` to inspect local session stores and how much Beacon has synced.
+
+## Install or configuration support
+
+`beacon endpoint install` prepares shared endpoint config and runtime log paths, and installs the user-level Cursor hooks when it detects Cursor (or when run with `--harness cursor`). To refresh or manage the hooks on their own, run:
+
+```bash title="Install runtime hooks"
+beacon endpoint hooks install --harness cursor
+```
+
+For project-level hooks, run:
+
+```bash title="Install project-level hooks"
+beacon endpoint hooks install --harness cursor --level project
+```
+
+## Telemetry coverage
+
+| Area | Support |
+|------|---------|
+| Prompt telemetry | Supported for local and cloud Cursor through `beforeSubmitPrompt` hooks. In Cursor Cloud, Beacon's install script writes the project hooks at Build time and prompts are uploaded as they happen; Cursor does not run the prompt hook in an agent's first turn, so the launch prompt is not recorded. See [Cursor's Cloud Agent hook support matrix](https://cursor.com/docs/hooks#cloud-agent-support). |
+| Turn identity | Supported. Cursor's `generation_id`, which changes with every user message, is promoted to `prompt.id` on hook events |
+| Command, tool, and file telemetry | Supported for tool, shell command, MCP-like, approval, and file edit payloads where Cursor exposes them; Cursor Cloud support is limited to Cursor's [cloud-supported command hooks](https://cursor.com/docs/hooks#cloud-agent-support). |
+| Pre-tool answer | `preToolUse`, `beforeShellExecution` and `beforeReadFile` answer `{"permission":"allow"}`, because Cursor's hooks reference does not make `permission` optional and blocks an action whose hook response does not match the schema. Cursor enforces only a hook's `deny`: an `allow` does not override your allowlist or approval mode, so a command Cursor would ask about still asks. A deny from a `BEACON_POLICY_PROVIDER` policy provider returns `{"permission":"deny"}` |
+| Agent responses | Supported for local and cloud Cursor through `afterAgentResponse` hooks. Each finished assistant message is recorded as an `agent.message` event with the reply text in `gen_ai.output.messages` (a `text` part) and a `content` marker, in the same turn (`prompt.id`) as the prompt that produced it. Cursor Cloud records them through Beacon's project hooks from the second turn on. `beacon endpoint cursor sync` also recovers committed assistant text |
+| Turn end | Supported for local and cloud Cursor through the `stop` hook, recorded as `tool.completed` ("Agent response completed") like every runtime's turn end. Cursor's `status` for the turn (`completed`, `aborted` or `error`) is kept verbatim as `turn.status`, so in the runtime log a stopped or failed turn can be told apart from a finished one, and a threat rule can match `e.turn.status`. The session view and shared traces do not show it yet |
+| Agent reasoning telemetry | Supported for local and cloud Cursor through `afterAgentThought` hooks. Each completed thinking block is recorded as an `agent.reasoning` event carrying the reasoning text in the OpenTelemetry GenAI output-messages shape (`gen_ai.output.messages` with a `reasoning` part), plus a `content` marker with the original text's hash and byte count. Reasoning is only available for models/modes where Cursor exposes visible thinking text. |
+| Repository and branch context | Events include the workspace path as `repository`, and `branch` is resolved from the workspace's local git checkout (`.git/HEAD`) when Cursor does not supply one; disable local git resolution with `BEACON_DISABLE_GIT_METADATA=1`. |
+| Token usage and cost | No Cursor hook payload or local record carries a token count or a cost. Team admins can collect per-request token usage and Cursor's charges from the Cursor Admin API with [`beacon endpoint cursor usage sync`](/cli/endpoint-cursor#token-usage-from-the-cursor-admin-api), which writes one `token.usage` event per request |
+| Context occupancy | Supported through `preCompact`, which reports `context_tokens` and `context_window_size`. Recorded as `gen_ai.context` (`used_tokens`, `limit_tokens`) and used by the token-usage utilization view. This is a level, not spend: it is never summed into a total, and Cursor still reports as `not_instrumented` in `beacon token-usage --coverage` because it has not said what a turn cost. The sibling `context_usage_percent` is derivable from the pair and stays in the retained payload. |
+| Historical session sync | Supported through `beacon endpoint cursor sync`; marked as poll collection |
+| Local JSONL and dashboard | Supported |
+| MDM deployment | Supported for the endpoint agent. Cursor hooks are installed separately in the logged-in user's context |
+
+## Session-store sync
+
+`beacon endpoint cursor sync` reads Cursor records after Cursor has committed them. It can recover committed prompts, assistant text, tool and command activity, file activity where the stored record names a path, and session metadata present in Cursor's local stores. It cannot hold or deny tool calls, and it does not imply that Beacon observed the event at runtime.
+
+Run `beacon endpoint cursor sync --watch`, or schedule one-shot sweeps, if you want the poll path to stay current.
+
+## Deployment notes
+
+Restart Cursor after installing or removing hooks so the updated hook configuration is picked up by new sessions.
+
+Hook events include metadata such as file path, operation, language, diff hash, and diff byte count. Raw diffs and reasoning text are subject to Beacon's redaction, sanitization, truncation, and event-size limits before writing.
+
+## Related
+
+<Columns cols={2}>
+  <Card title="Supported agent harnesses" icon="list-check" href="/runtimes">
+    Return to the runtime support overview.
+  </Card>
+  <Card title="Hooks" icon="plug" href="/cli/hooks">
+    Install, inspect, and uninstall runtime hook integrations.
+  </Card>
+  <Card title="Cursor Cloud Agents" icon="cloud" href="/runtimes/cursor-cloud-agents">
+    Capture Cursor cloud agent telemetry with sandbox-local hooks and direct GCS or S3 upload.
+  </Card>
+</Columns>

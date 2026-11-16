@@ -1,0 +1,57 @@
+---
+title: "beacon cloud cursor print-setup"
+description: "Print a Cursor cloud environment install script that installs Beacon and its hooks"
+---
+
+## Command overview
+
+`beacon cloud cursor print-setup` prints the install script for a Cursor cloud
+agent environment. Paste it into the environment's **Install script** field.
+
+```bash title="Command syntax"
+beacon cloud cursor print-setup --version vX.Y.Z
+```
+
+Cursor runs the install script when it creates a Build, before any agent
+starts. The script:
+
+- downloads `beacon-hooks` from the release you name into `/tmp/beacon/bin`,
+- writes Beacon's project hooks to `.cursor/hooks.json` in the checkout, with
+  the hook set [`beacon cloud cursor print-hooks`](/cli/cloud-cursor-print-hooks)
+  prints,
+- lists `.cursor/hooks.json` in `.git/info/exclude`, so agents never see it as a
+  change to commit,
+- leaves the repository alone if it commits its own `.cursor/hooks.json`.
+
+The Build keeps the binary and the hooks, so every agent in the environment
+starts with them. Nothing is committed, and the hooks never run in local Cursor
+sessions. An agent started before the environment's first Build runs without
+them and is not recorded.
+
+`--safe-hooks` leaves out the shell and edit hooks (`beforeShellExecution`,
+`afterShellExecution`, `afterFileEdit`), so you can prove the upload works
+before the agent's commands and edits pass through Beacon.
+
+## Examples
+
+Print the install script for a specific Beacon release:
+
+```bash title="Print the install script for a specific Beacon release"
+beacon cloud cursor print-setup --version vX.Y.Z
+```
+
+Replace `vX.Y.Z` with the latest Beacon release tag.
+
+## Related
+
+<Columns cols={2}>
+  <Card title="beacon cloud" icon="cloud" href="/cli/cloud">
+    Review cloud command group behavior.
+  </Card>
+  <Card title="beacon cloud cursor print-hooks" icon="plug" href="/cli/cloud-cursor-print-hooks">
+    Print the project hooks, to commit them yourself.
+  </Card>
+  <Card title="Cursor Cloud Agents" icon="cloud" href="/runtimes/cursor-cloud-agents">
+    Configure Cursor cloud agent telemetry end to end.
+  </Card>
+</Columns>

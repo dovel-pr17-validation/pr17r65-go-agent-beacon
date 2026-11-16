@@ -1,0 +1,133 @@
+---
+title: "beacon endpoint dsh"
+description: "Collect endpoint telemetry from DeepSeek Harness session records"
+---
+
+## Command overview
+
+`beacon endpoint dsh` reads the native session records DeepSeek Harness commits
+under `$DSH_HOME/sessions` (default `~/.dsh/sessions`) and maps them into Beacon
+[endpoint events](/concepts/core-concepts#endpoint-event).
+
+```bash title="Command syntax"
+beacon endpoint dsh [command]
+```
+
+This complements the live [DeepSeek Harness hooks](/runtimes/deepseek-harness).
+Hooks observe current tool activity and optional policy decisions. Session sync
+backfills assistant text and reasoning, tool failure status, persisted
+command/file/MCP detail, and token usage that the hook bridge does not expose.
+See [Reading the session store](/runtimes/deepseek-harness#reading-the-session-store)
+for how each record maps.
+
+Every event mapped from a session record is marked `harness.collection_method=poll`. Beacon
+reads committed records after the fact, so this path cannot hold, approve, deny, or delay
+a tool call and does not synthesize approval events. Reading is local and offline. A sweep
+also drains workspace spools: hook events that a sandboxed DeepSeek session staged in
+`<workspace>/.beacon/spool/deepseek_harness/` (or the older `<workspace>/.beacon/dsh-spool/`)
+are appended with the `harness.collection_method=hook` label they were captured under, so the
+two sources stay distinguishable in the log. See [`beacon endpoint spool`](/cli/endpoint-spool).
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `beacon endpoint dsh sync` | Read new DeepSeek Harness session records into the runtime log |
+| `beacon endpoint dsh status` | Show DeepSeek Harness sessions and collection progress |
+
+## Flags
+
+Both subcommands accept:
+
+| Flag | Description |
+|------|-------------|
+| `--dsh-home <path>` | DeepSeek Harness home. Defaults to `$DSH_HOME` or `~/.dsh` |
+| `--state <path>` | Collector cursor file. Defaults to `~/.beacon/endpoint/state/dsh.json` |
+| `--workspace <path>` | Only include sessions whose recorded cwd matches this workspace |
+| `--session-id <id>` | Only include one DeepSeek Harness session id |
+| `--json` | Print the result as JSON |
+| `--user` | Use per-user endpoint paths. Enabled by default |
+| `--system` | Use system endpoint paths |
+
+`sync` also accepts:
+
+| Flag | Description |
+|------|-------------|
+| `--log-path <path>` | Runtime JSONL log path. Defaults to the resolved endpoint log |
+| `--print` | Print mapped events without writing them or advancing the cursor |
+| `--watch` | Sweep continuously on `--interval` |
+| `--interval <duration>` | Sweep interval for `--watch`. Defaults to `1m`, with a 5-second floor |
+| `--rotate-bytes <bytes>` | Rotate the runtime log at this many bytes while this sync writes it. Defaults to 10485760, the size every Beacon writer uses; must not be smaller. See [large backfills and log rotation](/runtimes/claude-code#large-backfills-and-log-rotation) |
+
+## Sweeping
+
+```bash title="Sweep once"
+beacon endpoint dsh sync
+```
+
+```bash title="Preview without writing or advancing the cursor"
+beacon endpoint dsh sync --print
+```
+
+```bash title="Sweep continuously"
+beacon endpoint dsh sync --watch --interval 5m
+```
+
+Nothing schedules a sweep automatically. Run `sync` from the scheduler used on
+the endpoint, or leave `--watch` running in the account that owns `$DSH_HOME`.
+A partly written trailing record is left for the next sweep rather than treated
+as corruption.
+
+Each sweep also drains workspace spools. When DeepSeek Harness runs hooks
+inside its session sandbox, a hook that cannot write the runtime log stages the
+event in the [workspace spool](/cli/endpoint-spool),
+`<workspace>/.beacon/spool/deepseek_harness/<session>/`, a directory only your
+account can read; the sweep appends those events to the runtime log and
+removes them from the spool. Spools an earlier hook left in
+`<workspace>/.beacon/dsh-spool/<session>/` are drained too. The report says how many landed:
+
+```text
+dsh sync: 3 sessions, 1 changed, 12 events, 0 errors
+  2 spooled hook event(s) drained from workspace spools
+```
+
+Anything else in the spool is refused and counted as rejected: a line that does
+not decode, or one that is not a DeepSeek Harness hook event of the session
+whose workspace holds it. Actions only Beacon writes, such as
+`session.share_requested`, are refused too, since anything running in the
+workspace can write there.
+
+Drained events count against the sweep's limits like mapped ones, so an
+install-time backfill's byte budget can leave them staged for the next sync.
+Delivery is at least once: a sweep killed between appending a batch and
+removing it from the spool appends that batch again. Draining runs only in
+write mode: `--print` leaves spools untouched. The system-mode install backfill,
+which runs as root, leaves spools alone as well; your own `beacon endpoint dsh
+sync` drains them.
+
+## Status
+
+```bash title="Show sessions and collection progress"
+beacon endpoint dsh status
+```
+
+The cursor prevents scheduled sweeps from re-appending a session's complete
+history. Re-reading is safe: the same source record maps to the same deterministic
+event id.
+
+Status also reports `spool_bytes` per session — hook events staged in that
+session's workspace spool, waiting for the next sweep to drain them into the
+runtime log. Zero is the steady state; anything else means live capture worked
+and the last sweep has not run yet. The text form shows it as
+`(spool N B awaiting drain)`.
+
+## Related
+
+<Columns cols={2}>
+  <Card title="DeepSeek Harness" icon="code" href="/runtimes/deepseek-harness">
+    Hook installation, telemetry coverage, and known limitations.
+  </Card>
+  <Card title="beacon endpoint hooks" icon="plug" href="/cli/hooks">
+    Install and inspect the live DeepSeek Harness hook integration.
+  </Card>
+</Columns>

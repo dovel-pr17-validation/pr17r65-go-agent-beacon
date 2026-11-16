@@ -1,0 +1,127 @@
+id: fork-bomb-pattern
+version: 2
+title: Fork-bomb pattern executed in a command
+description: >
+  A command.executed event invokes a known fork-bomb shape — a function whose whole
+  body pipes one bare command into another in the background and that is then
+  called, such as the canonical `:(){ :|:& };:` under any name or spacing, the
+  `while true; do ... & done` recursive spawn loop, or a perl/python/ruby fork
+  loop. A fork bomb is a denial-of-
+  service primitive that recursively spawns processes to exhaust PID and
+  process-table resources; running one from an agent session is a strong
+  resource-DoS or destructive-escalation signal (OWASP LLM10). The rule is
+  anchored to a command boundary and matches the well-known shapes; ordinary
+  long-running but bounded loops do not fire because they do not recursively
+  spawn.
+severity: high
+status: experimental
+posture: detect
+taxonomy:
+  beacon_category: resource-consumption
+  owasp_llm: LLM10
+  mitre_atlas: AML.T0040
+
+match: >
+  e.event.action == "command.executed" && (
+    e.command.command.matches("(?i)[\\w:.-]+\\s*\\(\\s*\\)\\s*\\{?\\s*[\\w:.-]+\\s*\\|\\s*[\\w:.-]+\\s*&\\s*;?\\s*\\}?[ \\t]*[;\\n]\\s*[\\w:.-]+") ||
+    e.command.command.matches("(?i)\\bwhile\\s+true\\s*;?\\s*do\\b[^;&|]*&\\s*\\S") ||
+    e.command.command.matches("(?i)\\bfor\\s*\\(\\s*;\\s*;\\s*\\)\\s*[;{]") ||
+    e.command.command.matches("(?i)\\b(perl|python|ruby)\\s+-[ec]\\s+['\"][^'\"]*(\\.fork\\(\\)|for\\s+_\\s+in\\s+iter\\(\\s*int\\s*,\\s*1\\s*\\)|\\bwhile\\s+(1|True)\\b)")
+  )
+
+emit:
+  reason: "Fork-bomb pattern executed (resource-DoS primitive)"
+
+tests:
+  - name: canonical_bash_fork_bomb
+    verdict: match
+    events:
+      - timestamp: "2026-06-23T10:00:00Z"
+        event: { action: command.executed }
+        command: { command: ":(){ :|:& };:" }
+        session: { id: s1 }
+  - name: while_true_fork_loop
+    verdict: match
+    events:
+      - timestamp: "2026-06-23T10:01:00Z"
+        event: { action: command.executed }
+        command: { command: "while true; do nc -l 9999 & done" }
+        session: { id: s1 }
+  - name: for_loop_empty_init
+    verdict: match
+    events:
+      - timestamp: "2026-06-23T10:02:00Z"
+        event: { action: command.executed }
+        command: { command: "for(;;){ do_thing & }" }
+        session: { id: s1 }
+  - name: bash_c_fork_bomb_wrapper
+    verdict: match
+    events:
+      - timestamp: "2026-06-23T10:03:00Z"
+        event: { action: command.executed }
+        command: { command: "bash -c ':(){ :|:& };:'" }
+        session: { id: s1 }
+  - name: python_while_one_spawn
+    verdict: match
+    events:
+      - timestamp: "2026-06-23T10:04:00Z"
+        event: { action: command.executed }
+        command: { command: "python -c 'import os; [os.fork() for _ in iter(int,1)]'" }
+        session: { id: s1 }
+  - name: spaced_bash_fork_bomb
+    verdict: match
+    events:
+      - event: { action: command.executed }
+        command: { command: ":(){ :|: & };:" }
+        session: { id: s1 }
+  - name: named_bomb_function
+    verdict: match
+    events:
+      - event: { action: command.executed }
+        command: { command: "bomb(){ bomb|bomb& };bomb" }
+        session: { id: s1 }
+  - name: renamed_fork_bomb
+    verdict: match
+    events:
+      - event: { action: command.executed }
+        command: { command: "f(){ f|f& };f" }
+        session: { id: s1 }
+  - name: spaced_renamed_fork_bomb
+    verdict: match
+    events:
+      - event: { action: command.executed }
+        command: { command: "fork() { fork | fork & }; fork" }
+        session: { id: s1 }
+  - name: search_for_bomb_function
+    verdict: no_match
+    events:
+      - event: { action: command.executed }
+        command: { command: "grep -rn 'bomb()' src/" }
+        session: { id: s1 }
+  - name: backgrounded_pipeline_function
+    verdict: no_match
+    events:
+      - event: { action: command.executed }
+        command: { command: "watch(){ tail -f app.log | grep ERROR & }; watch" }
+        session: { id: s1 }
+  - name: bounded_while_loop_benign
+    verdict: no_match
+    events:
+      - timestamp: "2026-06-23T10:05:00Z"
+        event: { action: command.executed }
+        command: { command: "while true; do read line; done < /dev/null" }
+        session: { id: s1 }
+  - name: ordinary_long_running_command
+    verdict: no_match
+    events:
+      - timestamp: "2026-06-23T10:06:00Z"
+        event: { action: command.executed }
+        command: { command: "make -j8 build" }
+        session: { id: s1 }
+  - name: fork_bomb_mentioned_in_doc
+    verdict: no_match
+    events:
+      - timestamp: "2026-06-23T10:07:00Z"
+        event: { action: command.executed }
+        command: { command: "echo 'never run a fork bomb in this repo' > notes.txt" }
+        session: { id: s1 }

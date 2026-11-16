@@ -1,0 +1,871 @@
+package harness
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/claudeotel"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/claudesession"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/codexsession"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/devinsession"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/hooks"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/integrations/cowork"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/hermessession"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/tomledit"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/hookcmd"
+	"gopkg.in/yaml.v3"
+)
+
+type TelemetryStatus string
+
+const (
+	TelemetryEnabled       TelemetryStatus = "enabled"
+	TelemetryDisabled      TelemetryStatus = "disabled"
+	TelemetryMissing       TelemetryStatus = "missing"
+	TelemetryMisconfigured TelemetryStatus = "misconfigured"
+)
+
+type Harness struct {
+	Name            string          `json:"name"`
+	DisplayName     string          `json:"display_name"`
+	Detected        bool            `json:"detected"`
+	Version         string          `json:"version,omitempty"`
+	ExecutablePath  string          `json:"executable_path,omitempty"`
+	ConfigPath      string          `json:"config_path,omitempty"`
+	TelemetryStatus TelemetryStatus `json:"telemetry_status"`
+	Capability      string          `json:"capability,omitempty"`
+	Message         string          `json:"message,omitempty"`
+}
+
+type ConfigureOptions struct {
+	Endpoint string
+	UserMode bool
+	// CaptureModelContext has Claude Code log its API bodies so the collector can keep the context
+	// Claude Code gives the model that no other event reports: the pages WebFetch fetches and the
+	// MCP tool descriptions the model is shown.
+	// Off removes an inline setting a previous install wrote.
+	CaptureModelContext bool
+}
+
+type ValidationResult struct {
+	Harness string          `json:"harness"`
+	Status  TelemetryStatus `json:"status"`
+	Message string          `json:"message"`
+}
+
+func DiscoverAll() []Harness {
+	return []Harness{
+		DiscoverClaude(),
+		DiscoverCodex(),
+		DiscoverGemini(),
+		DiscoverAntigravity(),
+		DiscoverCopilotCLI(),
+		DiscoverOpenCode(),
+		DiscoverCline(),
+		DiscoverPi(),
+		DiscoverOmp(),
+		DiscoverOpenClaw(),
+		DiscoverGrok(),
+		DiscoverPrime(),
+		DiscoverOmo(),
+		DiscoverFx(),
+		DiscoverDsh(),
+		DiscoverQwen(),
+		DiscoverKimi(),
+		DiscoverKiro(),
+		DiscoverMuse(),
+		DiscoverOpenHands(),
+		DiscoverHermes(),
+		DiscoverFactory(),
+		DiscoverVSCode(),
+		DiscoverCursor(),
+		DiscoverDevin(),
+		DiscoverDevinDesktop(),
+		DiscoverClaudeCowork(),
+	}
+}
+
+func DiscoverAntigravity() Harness {
+	h := Harness{Name: "antigravity_cli", DisplayName: "Antigravity CLI", Capability: "hooks"}
+	detectExecutable(&h, "antigravity", "antigravity-cli", "agy")
+	home, _ := os.UserHomeDir()
+	userConfig := filepath.Join(home, ".gemini", "config", "hooks.json")
+	projectConfig := filepath.Join(".agents", "hooks.json")
+	h.ConfigPath = userConfig
+	level := hooks.LevelUser
+	if fileExists(projectConfig) {
+		h.ConfigPath = projectConfig
+		level = hooks.LevelProject
+	}
+	if !h.Detected && (dirExists(filepath.Join(home, ".gemini", "config")) || dirExists(".agents")) {
+		h.Detected = true
+	}
+	if fileExists(h.ConfigPath) {
+		status, msg := antigravityStatus(h.ConfigPath, level)
+		h.TelemetryStatus = status
+		h.Message = msg
+	} else {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Antigravity hooks.json was not found"
+	}
+	return h
+}
+
+func DiscoverClaude() Harness {
+	h := Harness{Name: "claude_code", DisplayName: "Claude Code", Capability: "otel_env"}
+	detectExecutable(&h, "claude")
+	home, _ := os.UserHomeDir()
+	configDir := claudesession.ConfigDir(home)
+	userConfig := ""
+	if configDir != "" {
+		userConfig = filepath.Join(configDir, "settings.json")
+	}
+	managedConfig := "/Library/Application Support/ClaudeCode/managed-settings.json"
+	if fileExists(managedConfig) {
+		h.ConfigPath = managedConfig
+		status, msg := claudeStatus(managedConfig)
+		h.TelemetryStatus = status
+		h.Message = msg
+	} else if userConfig != "" && fileExists(userConfig) {
+		h.ConfigPath = userConfig
+		status, msg := claudeStatus(userConfig)
+		h.TelemetryStatus = status
+		h.Message = msg
+	} else {
+		h.ConfigPath = userConfig
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Claude settings file was not found"
+	}
+	if !h.Detected && configDir != "" && dirExists(configDir) {
+		h.Detected = true
+	}
+	return h
+}
+
+func DiscoverCodex() Harness {
+	h := Harness{Name: "codex_cli", DisplayName: "Codex CLI", Capability: "otel_config"}
+	detectExecutable(&h, "codex")
+	home, _ := os.UserHomeDir()
+	dir, err := codexsession.HomeDir(home)
+	if err != nil {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Codex home directory could not be resolved: " + err.Error()
+		return h
+	}
+	h.ConfigPath = filepath.Join(dir, "config.toml")
+	if fileExists(h.ConfigPath) {
+		status, msg := codexStatus(h.ConfigPath)
+		h.TelemetryStatus = status
+		h.Message = msg
+	} else {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Codex config file was not found"
+	}
+	return h
+}
+
+func DiscoverFactory() Harness {
+	h := Harness{Name: "factory", DisplayName: "Factory Droid", Capability: "otel_env"}
+	detectExecutable(&h, "droid")
+	home, _ := os.UserHomeDir()
+	h.ConfigPath = factoryProfilePath(home)
+	if fileExists(h.ConfigPath) {
+		status, msg := factoryStatus(h.ConfigPath)
+		h.TelemetryStatus = status
+		h.Message = msg
+	} else {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Factory Droid telemetry is configured by the launch environment; set OTEL_TELEMETRY_ENDPOINT to the local OTLP HTTP receiver"
+	}
+	return h
+}
+
+func DiscoverOpenCode() Harness {
+	h := Harness{Name: "opencode", DisplayName: "opencode", Capability: "plugin"}
+	detectExecutable(&h, "opencode")
+	home, _ := os.UserHomeDir()
+	configDir, dirErr := hooks.OpenCodeConfigDir(home)
+	pluginPath := filepath.Join(configDir, "plugins", "beacon.ts")
+	if dirErr != nil {
+		pluginPath = filepath.Join(".config", "opencode", "plugins", "beacon.ts")
+	}
+	h.ConfigPath = pluginPath
+	if !h.Detected && dirErr == nil && dirExists(configDir) {
+		h.Detected = true
+	}
+	if fileExists(pluginPath) {
+		data, _ := os.ReadFile(pluginPath)
+		if strings.Contains(string(data), "beacon-managed-opencode-plugin:v1") {
+			h.TelemetryStatus = TelemetryEnabled
+			h.Message = "Beacon opencode plugin is configured"
+		} else {
+			h.TelemetryStatus = TelemetryDisabled
+			h.Message = "opencode plugin file exists but Beacon endpoint plugin was not found"
+		}
+	} else {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Beacon opencode plugin was not found"
+	}
+	return h
+}
+
+// DiscoverCline reports whether Cline is present and whether Beacon's plugin is installed for it.
+//
+// Unlike every other hook runtime, Cline cannot be found by looking for an executable. It runs as a
+// VS Code extension, a JetBrains plugin, and a CLI over one agent core, and the two IDE hosts ship
+// no `cline` binary at all -- so a binary probe reports "not detected" on the majority of real
+// installs. The ~/.cline directory is what every host shares, and the CLI binary is treated as an
+// extra signal rather than the deciding one.
+func DiscoverCline() Harness {
+	h := Harness{Name: "cline", DisplayName: "Cline", Capability: "plugin"}
+	detectExecutable(&h, "cline")
+	// The guard below is the point: Cline's project install is ".cline/plugins/beacon.ts", the user
+	// layout with the home prefix removed, so an unresolved home directory does not merely produce a
+	// useless path -- it produces exactly the path a project install occupies. Discovery would read
+	// a repository's own plugin and report Cline detected with telemetry enabled for the machine, on
+	// the strength of a file in whatever directory the command ran from. DiscoverPi guards the same
+	// way.
+	//
+	// The path comes from the installer rather than being rebuilt here so there is one definition of
+	// where the plugin lives; two copies is how discovery comes to report on a file the installer
+	// does not write.
+	pluginPath, err := hooks.ClinePluginPath(hooks.LevelUser)
+	if err != nil {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Cline plugin directory could not be resolved: " + err.Error()
+		return h
+	}
+	h.ConfigPath = pluginPath
+	if !h.Detected && dirExists(filepath.Dir(filepath.Dir(pluginPath))) {
+		h.Detected = true
+	}
+	if fileExists(pluginPath) {
+		data, _ := os.ReadFile(pluginPath)
+		if strings.Contains(string(data), "beacon-managed-cline-plugin:v1") {
+			h.TelemetryStatus = TelemetryEnabled
+			h.Message = "Beacon Cline plugin is configured"
+		} else {
+			h.TelemetryStatus = TelemetryDisabled
+			h.Message = "Cline plugin file exists but Beacon endpoint plugin was not found"
+		}
+	} else {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Beacon Cline plugin was not found"
+	}
+	return h
+}
+
+func DiscoverHermes() Harness {
+	h := Harness{Name: "hermes", DisplayName: "Hermes Agent", Capability: "hooks"}
+	detectExecutable(&h, "hermes")
+	home, _ := os.UserHomeDir()
+	dir, err := hermessession.HomeDir(home)
+	if err != nil {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Hermes home directory could not be resolved: " + err.Error()
+		return h
+	}
+	h.ConfigPath = filepath.Join(dir, "config.yaml")
+	if !h.Detected && dirExists(dir) {
+		h.Detected = true
+	}
+	if fileExists(h.ConfigPath) {
+		status, msg := hermesStatus(h.ConfigPath)
+		h.TelemetryStatus = status
+		h.Message = msg
+	} else {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Hermes config.yaml was not found"
+	}
+	return h
+}
+
+func DiscoverCursor() Harness {
+	h := Harness{Name: "cursor", DisplayName: "Cursor", Capability: "hooks"}
+	detectExecutable(&h, "cursor")
+	home, _ := os.UserHomeDir()
+	h.ConfigPath = filepath.Join(home, ".cursor", "hooks.json")
+	if !h.Detected && dirExists(filepath.Join(home, ".cursor")) {
+		h.Detected = true
+	}
+	if fileExists(h.ConfigPath) {
+		data, _ := os.ReadFile(h.ConfigPath)
+		if configured, _ := hooks.ConfigHasEndpointHook(data, "cursor"); configured {
+			h.TelemetryStatus = TelemetryEnabled
+			h.Message = "Cursor endpoint hooks are configured"
+		} else {
+			h.TelemetryStatus = TelemetryDisabled
+			h.Message = "Cursor hooks exist but endpoint hooks were not found"
+		}
+	} else {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Cursor hooks.json was not found"
+	}
+	return h
+}
+
+func DiscoverDevin() Harness {
+	h := Harness{Name: "devin-cli", DisplayName: "Devin CLI", Capability: "hooks"}
+	detectExecutable(&h, "devin")
+	home, _ := os.UserHomeDir()
+	userConfig := filepath.Join(home, ".config", "devin", "config.json")
+	projectConfig := filepath.Join(".devin", "hooks.v1.json")
+	h.ConfigPath = userConfig
+	if fileExists(projectConfig) {
+		h.ConfigPath = projectConfig
+	}
+	if !h.Detected && (dirExists(filepath.Join(home, ".config", "devin")) || dirExists(".devin")) {
+		h.Detected = true
+	}
+	if dbPath := devinsession.DefaultDBPath(); fileExists(dbPath) {
+		h.Detected = true
+		h.Message = fmt.Sprintf(" Session history found at %s; read it with beacon endpoint devin sync.", dbPath)
+	}
+	if fileExists(h.ConfigPath) {
+		status, msg := devinStatus(h.ConfigPath, "devin", "devin-cli")
+		h.TelemetryStatus = status
+		h.Message = msg + h.Message
+	} else {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Devin CLI endpoint hooks were not found" + h.Message
+	}
+	return h
+}
+
+func DiscoverDevinDesktop() Harness {
+	h := Harness{Name: "devin-desktop", DisplayName: "Devin Desktop", Capability: "hooks"}
+	home, _ := os.UserHomeDir()
+	appSupport := filepath.Join(home, "Library", "Application Support", "Devin")
+	appPath := "/Applications/Devin.app"
+	if dirExists(appSupport) {
+		h.Detected = true
+		h.ExecutablePath = appSupport
+	}
+	if fileExists(filepath.Join(appPath, "Contents", "Info.plist")) {
+		h.Detected = true
+		h.ExecutablePath = appPath
+	}
+	userConfig := filepath.Join(home, ".codeium", "windsurf", "hooks.json")
+	projectConfig := filepath.Join(".windsurf", "hooks.json")
+	h.ConfigPath = userConfig
+	if fileExists(projectConfig) {
+		h.ConfigPath = projectConfig
+	}
+	if !h.Detected && (dirExists(filepath.Join(home, ".codeium", "windsurf")) || dirExists(".windsurf")) {
+		h.Detected = true
+	}
+	if fileExists(h.ConfigPath) {
+		status, msg := windsurfCascadeStatus(h.ConfigPath, "devin-desktop")
+		h.TelemetryStatus = status
+		if status == TelemetryEnabled {
+			h.Message = msg + "; generate a Devin Desktop event and check the Beacon runtime log to validate hook execution"
+		} else {
+			h.Message = msg
+		}
+	} else {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Devin Desktop Cascade/Windsurf hooks.json was not found"
+	}
+	return h
+}
+
+func DiscoverClaudeCowork() Harness {
+	h := Harness{Name: "claude_cowork", DisplayName: "Claude Cowork", Capability: "admin_otel"}
+	// Detection asks the cowork package where Claude Desktop lives, rather than keeping a second copy
+	// of that list here. The two answers were allowed to drift and did: this one knew only the macOS
+	// path, so a Windows machine with Claude Desktop installed reported it as absent -- and an operator
+	// could not tell that from a machine that genuinely does not have it.
+	for _, path := range cowork.DesktopPathsForOS(runtime.GOOS) {
+		if dirExists(path) {
+			h.Detected = true
+			h.ExecutablePath = path
+			break
+		}
+	}
+	h.TelemetryStatus = TelemetryMissing
+	h.Message = "Claude Cowork telemetry is configured in Claude organization settings"
+	return h
+}
+
+func ConfigureClaude(opts ConfigureOptions) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(claudesession.ConfigDir(home), "settings.json")
+	settings, err := readSettingsForUpdate("Claude", path)
+	if err != nil {
+		return "", err
+	}
+	env, _ := settings["env"].(map[string]interface{})
+	if env == nil {
+		env = map[string]interface{}{}
+	}
+	// Claude Code runs with the user's shell environment, and a value in settings.json replaces the
+	// same variable from there. The routing a session would otherwise get is both, as far as Beacon
+	// can see the shell from here.
+	caller := map[string]string{}
+	for _, entry := range os.Environ() {
+		if key, value, ok := strings.Cut(entry, "="); ok {
+			caller[key] = value
+		}
+	}
+	for key, value := range env {
+		caller[key] = fmt.Sprint(value)
+	}
+	for key, value := range claudeotel.OTLPEnv(opts.Endpoint, caller) {
+		env[key] = value
+	}
+	// Inline API bodies carry the page WebFetch sends to its summarizer model and the
+	// MCP tool definitions the model is shown, the only place Claude Code reports
+	// either, and also the system prompt and the whole conversation. The collector's
+	// claude_api_body processor keeps only that context, but Claude Code is asked for
+	// them only on opt-in. Neither branch overrides 0, file:<dir> or a user's own
+	// limit; without the opt-in an inline value goes, so opting out works.
+	rawBodies, configured := env["OTEL_LOG_RAW_API_BODIES"]
+	switch {
+	case opts.CaptureModelContext && !configured:
+		env["OTEL_LOG_RAW_API_BODIES"] = "1"
+	case !opts.CaptureModelContext && claudeotel.InlineRawBodies(fmt.Sprint(rawBodies)):
+		delete(env, "OTEL_LOG_RAW_API_BODIES")
+	}
+	contentLimit, limited := env["CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH"]
+	switch {
+	case opts.CaptureModelContext && !limited && claudeotel.InlineRawBodies(fmt.Sprint(env["OTEL_LOG_RAW_API_BODIES"])):
+		env["CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH"] = claudeModelContextContentLimit
+	case !opts.CaptureModelContext && fmt.Sprint(contentLimit) == claudeModelContextContentLimit:
+		delete(env, "CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH")
+	}
+	settings["env"] = env
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return "", err
+	}
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return path, os.WriteFile(path, data, 0600)
+}
+
+func ConfigureCodex(opts ConfigureOptions) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	dir, err := codexsession.HomeDir(home)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "config.toml")
+	var existing string
+	if data, err := os.ReadFile(path); err == nil {
+		existing = string(data)
+		if err := backup(path, data); err != nil {
+			return "", err
+		}
+	}
+	updated := mergeCodexOTELWithPrompt(existing, opts.Endpoint, true)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return "", err
+	}
+	return path, os.WriteFile(path, []byte(updated), 0600)
+}
+
+func ValidateConfigured(endpoint string) []ValidationResult {
+	claude := DiscoverClaude()
+	codex := DiscoverCodex()
+	gemini := DiscoverGemini()
+	copilot := discoverCopilotCLI(endpoint)
+	factory := DiscoverFactory()
+	vscode := discoverVSCode(endpoint)
+	return []ValidationResult{
+		{
+			Harness: claude.Name,
+			Status:  claude.TelemetryStatus,
+			Message: validateEndpointMessage(claude.TelemetryStatus, claude.Message, endpoint),
+		},
+		{
+			Harness: codex.Name,
+			Status:  codex.TelemetryStatus,
+			Message: validateEndpointMessage(codex.TelemetryStatus, codex.Message, endpoint),
+		},
+		{
+			Harness: gemini.Name,
+			Status:  gemini.TelemetryStatus,
+			Message: validateEndpointMessage(gemini.TelemetryStatus, gemini.Message, endpoint),
+		},
+		{
+			Harness: copilot.Name,
+			Status:  copilot.TelemetryStatus,
+			Message: validateEndpointMessage(copilot.TelemetryStatus, copilot.Message, endpoint),
+		},
+		{
+			Harness: factory.Name,
+			Status:  factory.TelemetryStatus,
+			Message: validateEndpointMessage(factory.TelemetryStatus, factory.Message, endpoint),
+		},
+		{
+			Harness: vscode.Name,
+			Status:  vscode.TelemetryStatus,
+			Message: validateEndpointMessage(vscode.TelemetryStatus, vscode.Message, endpoint),
+		},
+	}
+}
+
+func mergeCodexOTEL(existing, endpoint string) string {
+	return mergeCodexOTELWithPrompt(existing, endpoint, true)
+}
+
+// mergeCodexOTELWithPrompt replaces every [otel] and [otel.*] table with Beacon's, appended at
+// the end of the document.
+func mergeCodexOTELWithPrompt(existing, endpoint string, logUserPrompt bool) string {
+	eol := tomledit.LineEnding(existing, "\n")
+	stripped, _ := tomledit.RemoveTable(existing, "otel")
+	block := strings.Join(codexOTELBlock(endpoint, logUserPrompt), eol) + eol
+	return tomledit.Append(stripped, block, eol)
+}
+
+func codexOTELBlock(endpoint string, logUserPrompt bool) []string {
+	return []string{
+		"[otel]",
+		"environment = \"dev\"",
+		fmt.Sprintf("log_user_prompt = %t", logUserPrompt),
+		"",
+		"[otel.exporter.\"otlp-grpc\"]",
+		fmt.Sprintf("endpoint = %q", endpoint),
+		"",
+		// Codex's completed-turn trace carries thread, turn, model, and token
+		// fields together. The histogram exporter omits thread identity, so
+		// Beacon uses traces as the one live source and avoids double-counting
+		// the same turn through both channels.
+		"[otel.trace_exporter.\"otlp-grpc\"]",
+		fmt.Sprintf("endpoint = %q", endpoint),
+	}
+}
+
+func claudeStatus(path string) (TelemetryStatus, string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return TelemetryMissing, err.Error()
+	}
+	settings, err := decodeSettings("Claude", path, data)
+	if err != nil {
+		return TelemetryMisconfigured, err.Error()
+	}
+	env, _ := settings["env"].(map[string]interface{})
+	if env == nil {
+		return TelemetryDisabled, "Claude telemetry env is missing"
+	}
+	if fmt.Sprint(env["CLAUDE_CODE_ENABLE_TELEMETRY"]) != "1" {
+		return TelemetryDisabled, "CLAUDE_CODE_ENABLE_TELEMETRY is not enabled"
+	}
+	if !localOTLPEndpoint(env["OTEL_EXPORTER_OTLP_ENDPOINT"]) {
+		return TelemetryMisconfigured, "OTLP endpoint does not point to localhost"
+	}
+	for _, key := range claudeotel.RedirectKeys() {
+		if value, set := env[key]; set && strings.TrimSpace(fmt.Sprint(value)) != "" && !localOTLPEndpoint(value) {
+			return TelemetryMisconfigured, key + " sends Claude telemetry away from localhost"
+		}
+	}
+	return TelemetryEnabled, "Claude telemetry is configured for local OTLP"
+}
+
+func localOTLPEndpoint(value interface{}) bool {
+	endpoint := fmt.Sprint(value)
+	return strings.Contains(endpoint, "127.0.0.1") || strings.Contains(endpoint, "localhost")
+}
+
+func codexStatus(path string) (TelemetryStatus, string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return TelemetryMissing, err.Error()
+	}
+	text := string(data)
+	if !strings.Contains(text, "[otel]") {
+		return TelemetryDisabled, "Codex [otel] config is missing"
+	}
+	if !strings.Contains(text, "otlp-grpc") && !strings.Contains(text, "otlp-http") {
+		return TelemetryDisabled, "Codex OTEL exporter is not configured"
+	}
+	if !strings.Contains(text, "127.0.0.1") && !strings.Contains(text, "localhost") {
+		return TelemetryMisconfigured, "Codex OTLP endpoint does not point to localhost"
+	}
+	return TelemetryEnabled, "Codex telemetry is configured for local OTLP"
+}
+
+func factoryStatus(path string) (TelemetryStatus, string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return TelemetryMissing, err.Error()
+	}
+	text := string(data)
+	endpoint := shellExportValue(text, "OTEL_TELEMETRY_ENDPOINT")
+	if endpoint == "" {
+		return TelemetryDisabled, "Factory Droid OTEL_TELEMETRY_ENDPOINT is not configured"
+	}
+	if !strings.Contains(endpoint, "127.0.0.1") && !strings.Contains(endpoint, "localhost") {
+		return TelemetryMisconfigured, "Factory Droid OTEL endpoint does not point to localhost"
+	}
+	return TelemetryEnabled, "Factory Droid telemetry is configured for local OTLP HTTP"
+}
+
+func devinStatus(path string, platforms ...string) (TelemetryStatus, string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return TelemetryMissing, err.Error()
+	}
+	if hasBeaconDevinHooks, err := hasBeaconDevinHooks(data, platforms...); err != nil {
+		return TelemetryMisconfigured, "Devin hooks JSON is invalid"
+	} else if hasBeaconDevinHooks {
+		return TelemetryEnabled, "Devin endpoint hooks are configured"
+	}
+	return TelemetryDisabled, "Devin hooks exist but endpoint hooks were not found"
+}
+
+func hasBeaconDevinHooks(data []byte, platforms ...string) (bool, error) {
+	if len(platforms) == 0 {
+		platforms = []string{"devin"}
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return false, err
+	}
+	rawHooks := data
+	if raw, ok := root["hooks"]; ok {
+		rawHooks = raw
+	}
+	var events map[string][]struct {
+		Hooks []struct {
+			Command string `json:"command"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(rawHooks, &events); err != nil {
+		return false, nil
+	}
+	for _, groups := range events {
+		for _, group := range groups {
+			for _, hook := range group.Hooks {
+				for _, platform := range platforms {
+					if hookcmd.IsEndpointHook(hook.Command, platform) {
+						return true, nil
+					}
+				}
+			}
+		}
+	}
+	return false, nil
+}
+
+func windsurfCascadeStatus(path string, platform string) (TelemetryStatus, string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return TelemetryMissing, err.Error()
+	}
+	if hasHooks, err := hasBeaconWindsurfHooks(data, platform); err != nil {
+		return TelemetryMisconfigured, "Cascade/Windsurf hooks JSON is invalid"
+	} else if hasHooks {
+		return TelemetryEnabled, "Devin Desktop Cascade/Windsurf endpoint hooks are configured"
+	}
+	return TelemetryDisabled, "Cascade/Windsurf hooks exist but Devin Desktop endpoint hooks were not found"
+}
+
+func hasBeaconWindsurfHooks(data []byte, platform string) (bool, error) {
+	var root struct {
+		Hooks map[string][]struct {
+			Command string `json:"command"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return false, err
+	}
+	for _, refs := range root.Hooks {
+		for _, hook := range refs {
+			if hookcmd.IsEndpointHook(hook.Command, platform) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func hermesStatus(path string) (TelemetryStatus, string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return TelemetryMissing, err.Error()
+	}
+	hasHooks, err := hasBeaconHermesHooks(data)
+	if err != nil {
+		return TelemetryMisconfigured, "Hermes config.yaml is invalid"
+	}
+	if hasHooks {
+		return TelemetryEnabled, "Hermes Agent endpoint hooks are configured"
+	}
+	return TelemetryDisabled, "Hermes config exists but endpoint hooks were not found"
+}
+
+func hasBeaconHermesHooks(data []byte) (bool, error) {
+	var root struct {
+		Hooks map[string][]struct {
+			Command string `yaml:"command"`
+		} `yaml:"hooks"`
+	}
+	if len(data) == 0 {
+		return false, nil
+	}
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return false, err
+	}
+	for _, refs := range root.Hooks {
+		for _, ref := range refs {
+			if hookcmd.IsEndpointHook(ref.Command, "hermes") {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func antigravityStatus(path string, level hooks.Level) (TelemetryStatus, string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return TelemetryMissing, err.Error()
+	}
+	current, legacy, err := hooks.AntigravityConfigEndpointHooks(data)
+	if err != nil {
+		return TelemetryMisconfigured, "Antigravity hooks JSON is invalid"
+	}
+	if current {
+		return TelemetryEnabled, "Antigravity endpoint hooks are configured"
+	}
+	if legacy {
+		return TelemetryDisabled, hooks.AntigravityLegacyHooksMessage(level)
+	}
+	return TelemetryDisabled, "Antigravity hooks exist but endpoint hooks were not found"
+}
+
+func shellExportValue(text, key string) string {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "export ")
+		if !strings.HasPrefix(line, key+"=") {
+			continue
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(line, key+"="))
+		return strings.Trim(value, `"'`)
+	}
+	return ""
+}
+
+func factoryProfilePath(home string) string {
+	switch filepath.Base(os.Getenv("SHELL")) {
+	case "zsh":
+		return filepath.Join(home, ".zshrc")
+	case "bash":
+		return filepath.Join(home, ".bash_profile")
+	default:
+		return filepath.Join(home, ".profile")
+	}
+}
+
+// detectExecutable looks up each candidate command name on PATH and, on the
+// first match, marks the harness detected and records its executable path and
+// version. Names are tried in order.
+func detectExecutable(h *Harness, names ...string) {
+	for _, name := range names {
+		path, err := exec.LookPath(name)
+		if err == nil {
+			h.Detected = true
+			h.ExecutablePath = path
+			h.Version = commandVersion(path)
+			return
+		}
+	}
+}
+
+func commandVersion(path string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "--version")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// claudeModelContextContentLimit is the inline content limit Beacon sets for Claude Code with
+// --claude-capture-model-context. A request body lists the conversation and system prompt before
+// the tools array, and Claude Code puts MCP tools after its built-in ones, so at its default limit
+// the MCP tools are the first thing cut. In a one-prompt session they already start about 72 KB in;
+// the first request of a session is the one that matters, since the collector lists each tool once
+// per session.
+const claudeModelContextContentLimit = "262144"
+
+// decodeSettings parses a harness's JSON settings file. The error names the file so the user
+// knows which one to fix.
+func decodeSettings(product, path string, data []byte) (map[string]interface{}, error) {
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil, fmt.Errorf("%s settings file %s is not valid JSON: %w", product, path, err)
+	}
+	if settings == nil {
+		settings = map[string]interface{}{}
+	}
+	return settings, nil
+}
+
+// readSettingsForUpdate reads a harness's JSON settings file before Beacon rewrites it. A missing
+// file is an empty object. A file that does not parse is refused rather than replaced, because it
+// still holds the user's own settings; a file that does is backed up first.
+func readSettingsForUpdate(product, path string) (map[string]interface{}, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return map[string]interface{}{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	settings, err := decodeSettings(product, path, data)
+	if err != nil {
+		return nil, err
+	}
+	if err := backup(path, data); err != nil {
+		return nil, err
+	}
+	return settings, nil
+}
+
+func backup(path string, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	backupPath := fmt.Sprintf("%s.beacon.%s.bak", path, time.Now().UTC().Format("20060102T150405Z"))
+	return os.WriteFile(backupPath, data, 0600)
+}
+
+func validateEndpointMessage(status TelemetryStatus, msg, endpoint string) string {
+	if status != TelemetryEnabled {
+		return msg
+	}
+	if endpoint != "" && !strings.Contains(msg, "local OTLP") {
+		return "telemetry enabled but endpoint could not be fully validated"
+	}
+	return msg
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}

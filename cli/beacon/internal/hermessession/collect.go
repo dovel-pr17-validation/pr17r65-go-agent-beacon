@@ -1,0 +1,1101 @@
+package hermessession
+
+import (
+	"crypto/sha1"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/writer"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionfs"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionsync"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionwindow"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
+	_ "modernc.org/sqlite"
+)
+
+const (
+	Harness      = "hermes"
+	StateVersion = 1
+)
+
+type Cursor struct {
+	LastMessageID    int64                      `json:"last_message_id"`
+	Started          bool                       `json:"started"`
+	EndedAtMS        int64                      `json:"ended_at_ms,omitempty"`
+	InputTokens      int64                      `json:"input_tokens,omitempty"`
+	OutputTokens     int64                      `json:"output_tokens,omitempty"`
+	CacheReadTokens  int64                      `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int64                      `json:"cache_write_tokens,omitempty"`
+	ReasoningTokens  int64                      `json:"reasoning_tokens,omitempty"`
+	CostUSD          float64                    `json:"cost_usd,omitempty"`
+	PendingCalls     map[string]json.RawMessage `json:"pending_calls,omitempty"`
+	// KeyedByHome keys the session's event ids by the Hermes home this cursor belongs to. It is set
+	// when another home already holds the session id, as a cloned profile does: both start from a
+	// copy of one state.db, and once the copies diverge their message ids count up independently, so
+	// unkeyed ids would name different events the same. It is decided before the session's first
+	// event is written and never changes after, so a session's ids stay stable.
+	KeyedByHome bool `json:"keyed_by_home,omitempty"`
+}
+
+type State struct {
+	Version  int                `json:"version"`
+	Sessions map[string]*Cursor `json:"sessions"`
+}
+
+type CollectOptions struct {
+	DBPath string
+	// StatePath is this home's cursor file. The session home file beside it (SessionHomesPath) is
+	// shared by every home whose cursor sits in the same directory, and decides which of them keys a
+	// session's event ids by home. Without a StatePath no ids are keyed.
+	StatePath string
+	Write     bool
+	LogPath   string
+	UserMode  bool
+	Print     bool
+	Out       io.Writer
+	// Since, when set, limits the sweep to sessions modified at or after it, newest first. Older
+	// sessions are not read and their cursors do not move, so a later sync still collects them.
+	// The install-time backfill sets it; an ordinary sync leaves it zero.
+	Since time.Time
+	// Budget, when set, caps the bytes this sweep may append. The sweep stops at the first event
+	// that does not fit and returns writer.ErrBudgetSpent, with cursors past only what was written.
+	Budget *writer.Budget
+	// LegacyStatePath, when set, is the unkeyed cursor this home was advancing before cursors were
+	// keyed by home. A sweep whose StatePath holds no sessions yet starts from it, so an upgrade does not
+	// re-emit history that was already collected; the cursor is then saved to StatePath.
+	LegacyStatePath string
+	// RotateBytes is the size the runtime log rotates at while this sweep writes it; zero is
+	// writer.DefaultRotateBytes.
+	RotateBytes int64
+
+	// guard keeps the sweep from rotating its own output out of the log; CollectOnce sets it.
+	guard *writer.RetentionGuard
+}
+
+type Summary struct {
+	Sessions        int `json:"sessions"`
+	SessionsChanged int `json:"sessions_changed"`
+	EventsEmitted   int `json:"events_emitted"`
+	Errors          int `json:"errors"`
+	sessionsync.Retention
+}
+
+type Session struct {
+	ID               string
+	Source           string
+	Model            string
+	CWD              string
+	Title            string
+	ParentSessionID  string
+	StartedAtMS      int64
+	EndedAtMS        int64
+	LastMessageAtMS  int64
+	EndReason        string
+	MessageCount     int64
+	ToolCallCount    int64
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	ReasoningTokens  int64
+	EstimatedCostUSD float64
+	ActualCostUSD    float64
+	CostStatus       string
+	CostSource       string
+}
+
+type Message struct {
+	ID                int64
+	SessionID         string
+	Role              string
+	Content           string
+	ToolCallID        string
+	ToolCalls         string
+	ToolName          string
+	TimestampMS       int64
+	TokenCount        int64
+	FinishReason      string
+	Reasoning         string
+	ReasoningContent  string
+	ReasoningDetails  string
+	PlatformMessageID string
+	Observed          bool
+	Active            bool
+}
+
+type MappedEvent struct {
+	SourceMessageID int64
+	Event           schema.Event
+}
+
+func DefaultStatePath(hermesHome string) string {
+	base := filepath.Join(os.TempDir(), "beacon")
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		base = filepath.Join(home, ".beacon")
+	}
+	return filepath.Join(base, "endpoint", "state", StateFileName("hermes", hermesHome))
+}
+
+// StateFileName names the cursor file for the Hermes home a sweep reads. The native root keeps the
+// unkeyed name, so an existing install resumes from the cursor it already has. Every other home, a
+// profile or a custom HERMES_HOME, gets a file named for its profile and keyed by its resolved path,
+// so two homes never share a cursor even when both are the default profile of their own root or
+// hold profiles of the same name.
+func StateFileName(stem, hermesHome string) string {
+	resolved := canonicalHome(hermesHome)
+	userHome, _ := os.UserHomeDir()
+	if root := nativeRoot(userHome); root != "" && canonicalHome(root) == resolved {
+		return stem + ".json"
+	}
+	sum := sha256.Sum256([]byte(resolved))
+	return fmt.Sprintf("%s-%s-%x.json", stem, Profile(hermesHome), sum[:6])
+}
+
+// LoadStateSeeded loads the cursor at path, or the one at legacy while path holds no sessions yet, as
+// on the first sweep after cursors were keyed by home. Nothing is written: the caller's next Save
+// puts the seeded cursor at path. Cursors are per session id, so a legacy entry for a session this
+// home does not have is inert.
+func LoadStateSeeded(path, legacy string) (*State, error) {
+	state, err := LoadState(path)
+	if err != nil || legacy == "" || legacy == path || len(state.Sessions) > 0 {
+		return state, err
+	}
+	return LoadState(legacy)
+}
+
+var stateFile = sessionsync.StateFile[State]{
+	Name:  "Hermes",
+	New:   func() *State { return &State{Version: StateVersion, Sessions: map[string]*Cursor{}} },
+	Valid: func(s *State) bool { return s.Version == StateVersion && s.Sessions != nil },
+	Stamp: func(s *State) { s.Version = StateVersion },
+}
+
+func LoadState(path string) (*State, error) { return stateFile.Load(path) }
+
+func (s *State) Save(path string) error { return stateFile.Save(path, s) }
+
+func (s *State) cursor(sessionID string) *Cursor {
+	if s.Sessions == nil {
+		s.Sessions = map[string]*Cursor{}
+	}
+	cursor := s.Sessions[sessionID]
+	if cursor == nil {
+		cursor = &Cursor{}
+		s.Sessions[sessionID] = cursor
+	}
+	return cursor
+}
+
+func CollectOnce(opts CollectOptions) (summary Summary, err error) {
+	dbPath := opts.DBPath
+	if dbPath == "" {
+		dbPath = DefaultDBPath()
+	}
+	if _, statErr := sessionfs.Stat(dbPath); statErr != nil {
+		if os.IsNotExist(statErr) {
+			return summary, nil
+		}
+		return summary, statErr
+	}
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		return summary, err
+	}
+	defer store.Close()
+	sessions, err := store.ListSessions()
+	if err != nil {
+		return summary, err
+	}
+	sessions = sessionwindow.Recent(sessions, opts.Since, func(r Session) int64 { return max(r.StartedAtMS, r.EndedAtMS, r.LastMessageAtMS) })
+	summary.Sessions = len(sessions)
+	state, err := LoadStateSeeded(opts.StatePath, opts.LegacyStatePath)
+	if err != nil {
+		return summary, err
+	}
+	if err := assignEventIDHomes(SessionHomesPath(opts.StatePath), canonicalHome(filepath.Dir(store.Path())), sessions, state); err != nil {
+		return summary, fmt.Errorf("assign Hermes event id homes: %w", err)
+	}
+	defer func() {
+		if saveErr := state.Save(opts.StatePath); saveErr != nil && err == nil {
+			err = fmt.Errorf("save Hermes collector state: %w", saveErr)
+		}
+	}()
+	var errs []error
+	opts.guard = sessionsync.NewRetentionGuard(opts.Print, opts.Write)
+	var stopErr error
+	for _, session := range sessions {
+		changed, collectErr := collectSession(store, session, state, opts, &summary)
+		if sessionsync.Stopped(collectErr) {
+			// Not a failed session: this one and the rest are left for a later sync, with cursors
+			// that have not moved past anything that was not written.
+			if changed {
+				summary.SessionsChanged++
+			}
+			stopErr = collectErr
+			errs = append(errs, collectErr)
+			break
+		}
+		if collectErr != nil {
+			summary.Errors++
+			errs = append(errs, fmt.Errorf("Hermes session %s: %w", session.ID, collectErr))
+			continue
+		}
+		if changed {
+			summary.SessionsChanged++
+		}
+	}
+	if rotatedOut := summary.Finish(opts.sink(), stopErr); rotatedOut != nil {
+		errs = append(errs, rotatedOut)
+	}
+	if len(errs) > 0 {
+		return summary, errors.Join(errs...)
+	}
+	return summary, nil
+}
+
+func collectSession(store *Store, session Session, state *State, opts CollectOptions, summary *Summary) (bool, error) {
+	cursor := state.cursor(session.ID)
+	messages, err := store.ReadMessages(session.ID, cursor.LastMessageID)
+	if err != nil {
+		return false, err
+	}
+	home := filepath.Dir(store.Path())
+	idHome := ""
+	if cursor.KeyedByHome {
+		idHome = canonicalHome(home)
+	}
+	mapped, pending := mapSession(session, messages, cursor, idHome)
+	for i := range mapped {
+		mapped[i].Event.Harness.ConfigPath = home
+		mapped[i].Event.Harness.Profile = Profile(home)
+	}
+	if len(mapped) == 0 {
+		cursor.PendingCalls = pending
+		advanceCursorMessages(cursor, messages)
+		updateCursorTotals(cursor, session)
+		return false, nil
+	}
+	for _, item := range mapped {
+		if err := opts.sink().Emit(item.Event); err != nil {
+			return true, err
+		}
+		summary.EventsEmitted++
+	}
+	// The cursor only moves once the whole batch is on disk. CollectOnce saves the state even when a
+	// session fails, so advancing while emitting would skip the events the failed sweep never wrote.
+	cursor.PendingCalls = pending
+	for _, item := range mapped {
+		if item.SourceMessageID > cursor.LastMessageID {
+			cursor.LastMessageID = item.SourceMessageID
+		}
+		switch item.Event.Event.Action {
+		case "session.started":
+			cursor.Started = true
+		case "session.ended":
+			cursor.EndedAtMS = session.EndedAtMS
+		}
+	}
+	advanceCursorMessages(cursor, messages)
+	updateCursorTotals(cursor, session)
+	return true, nil
+}
+
+func advanceCursorMessages(cursor *Cursor, messages []Message) {
+	for _, message := range messages {
+		if message.ID > cursor.LastMessageID {
+			cursor.LastMessageID = message.ID
+		}
+	}
+}
+
+func updateCursorTotals(cursor *Cursor, session Session) {
+	if session.InputTokens > cursor.InputTokens {
+		cursor.InputTokens = session.InputTokens
+	}
+	if session.OutputTokens > cursor.OutputTokens {
+		cursor.OutputTokens = session.OutputTokens
+	}
+	if session.CacheReadTokens > cursor.CacheReadTokens {
+		cursor.CacheReadTokens = session.CacheReadTokens
+	}
+	if session.CacheWriteTokens > cursor.CacheWriteTokens {
+		cursor.CacheWriteTokens = session.CacheWriteTokens
+	}
+	if session.ReasoningTokens > cursor.ReasoningTokens {
+		cursor.ReasoningTokens = session.ReasoningTokens
+	}
+	if cost := sessionCost(session); cost > cursor.CostUSD {
+		cursor.CostUSD = cost
+	}
+	if session.EndedAtMS > 0 && cursor.EndedAtMS == 0 {
+		cursor.EndedAtMS = session.EndedAtMS
+	}
+}
+
+func (o CollectOptions) sink() sessionsync.Sink {
+	return sessionsync.Sink{Print: o.Print, Out: o.Out, Write: o.Write, Log: writer.Options{Path: o.LogPath, UserMode: o.UserMode, RotateSize: o.RotateBytes, Budget: o.Budget, Guard: o.guard}}
+}
+
+type Store struct {
+	path string
+	db   *sql.DB
+	// Hermes adds columns to an existing state.db as it upgrades, so an older database lacks some
+	// the collector reads, such as cwd and archived. Those read as NULL or their default instead.
+	sessionCols, messageCols map[string]bool
+}
+
+func OpenStore(path string) (*Store, error) {
+	db, err := sessionsync.OpenSQLite(path, "busy_timeout(1000)")
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	store := &Store{path: path, db: db}
+	if store.sessionCols, err = sessionsync.TableColumns(db, "sessions"); err == nil {
+		store.messageCols, err = sessionsync.TableColumns(db, "messages")
+	}
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// column is alias.name when the table has the column, and fallback when it does not.
+func column(cols map[string]bool, alias, name, fallback string) string {
+	if !cols[name] {
+		return fallback
+	}
+	if alias != "" {
+		return alias + "." + name
+	}
+	return name
+}
+
+// columns selects each name, or NULL for one the table does not have.
+func columns(cols map[string]bool, names ...string) string {
+	out := make([]string, len(names))
+	for i, name := range names {
+		out[i] = column(cols, "", name, "NULL")
+	}
+	return strings.Join(out, ", ")
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) Path() string { return s.path }
+
+func (s *Store) ListSessions() ([]Session, error) {
+	rows, err := s.db.Query(`
+SELECT id, source, ` + columns(s.sessionCols, "model", "cwd", "title", "parent_session_id") + `, started_at,
+       ` + columns(s.sessionCols, "ended_at", "end_reason", "message_count", "tool_call_count", "input_tokens",
+		"output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd",
+		"actual_cost_usd", "cost_status", "cost_source") + `,
+       (SELECT max(m.timestamp) FROM messages m WHERE m.session_id = sessions.id AND ` + column(s.messageCols, "m", "active", "1") + ` = 1) AS last_message_at
+FROM sessions
+WHERE ` + column(s.sessionCols, "", "archived", "0") + ` = 0
+ORDER BY started_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Session
+	for rows.Next() {
+		var s Session
+		var model, cwd, title, parent, endReason, costStatus, costSource sql.NullString
+		var started, ended, lastMsg sql.NullFloat64
+		var msgCount, toolCount, input, output, cacheRead, cacheWrite, reasoning sql.NullInt64
+		var estimatedCost, actualCost sql.NullFloat64
+		if err := rows.Scan(&s.ID, &s.Source, &model, &cwd, &title, &parent, &started, &ended, &endReason,
+			&msgCount, &toolCount, &input, &output, &cacheRead, &cacheWrite, &reasoning,
+			&estimatedCost, &actualCost, &costStatus, &costSource, &lastMsg); err != nil {
+			return nil, err
+		}
+		s.Model = model.String
+		s.CWD = cwd.String
+		s.Title = title.String
+		s.ParentSessionID = parent.String
+		s.StartedAtMS = secondsToMillis(started)
+		s.EndedAtMS = secondsToMillis(ended)
+		s.LastMessageAtMS = secondsToMillis(lastMsg)
+		s.EndReason = endReason.String
+		s.MessageCount = msgCount.Int64
+		s.ToolCallCount = toolCount.Int64
+		s.InputTokens = input.Int64
+		s.OutputTokens = output.Int64
+		s.CacheReadTokens = cacheRead.Int64
+		s.CacheWriteTokens = cacheWrite.Int64
+		s.ReasoningTokens = reasoning.Int64
+		s.EstimatedCostUSD = estimatedCost.Float64
+		s.ActualCostUSD = actualCost.Float64
+		s.CostStatus = costStatus.String
+		s.CostSource = costSource.String
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ReadMessages(sessionID string, afterID int64) ([]Message, error) {
+	rows, err := s.db.Query(`
+SELECT id, session_id, role, `+columns(s.messageCols, "content", "tool_call_id", "tool_calls", "tool_name")+`, timestamp,
+       `+columns(s.messageCols, "token_count", "finish_reason", "reasoning", "reasoning_content", "reasoning_details",
+		"platform_message_id", "observed")+`, `+column(s.messageCols, "", "active", "1")+`
+FROM messages
+WHERE session_id = ? AND `+column(s.messageCols, "", "active", "1")+` = 1 AND id > ?
+ORDER BY id`, sessionID, afterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Message
+	for rows.Next() {
+		var m Message
+		var content, callID, calls, toolName, finish, reasoning, reasoningContent, reasoningDetails, platformID sql.NullString
+		var ts sql.NullFloat64
+		var token sql.NullInt64
+		var observed, active sql.NullInt64
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &content, &callID, &calls, &toolName, &ts, &token, &finish,
+			&reasoning, &reasoningContent, &reasoningDetails, &platformID, &observed, &active); err != nil {
+			return nil, err
+		}
+		m.Content = content.String
+		m.ToolCallID = callID.String
+		m.ToolCalls = calls.String
+		m.ToolName = toolName.String
+		m.TimestampMS = secondsToMillis(ts)
+		m.TokenCount = token.Int64
+		m.FinishReason = finish.String
+		m.Reasoning = reasoning.String
+		m.ReasoningContent = reasoningContent.String
+		m.ReasoningDetails = reasoningDetails.String
+		m.PlatformMessageID = platformID.String
+		m.Observed = observed.Int64 != 0
+		m.Active = active.Int64 != 0
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// SessionDetail is what a session listing needs beyond ListSessions: where the session stands and
+// what spawned it.
+type SessionDetail struct {
+	// Branch is the git branch Hermes recorded for the session's directory. Older databases have no
+	// git_branch column and leave it empty.
+	Branch string
+	// DelegateFrom names the session that spawned this one as a delegate subagent, from the
+	// _delegate_from marker Hermes writes into model_config ("__orphaned__" once that parent is
+	// deleted). Compression continuations and /branch forks also carry a parent_session_id, but no
+	// marker: they continue the conversation rather than run a delegated task.
+	DelegateFrom string
+	// FirstPrompt is the session's first user message.
+	FirstPrompt string
+	// LastMessageAtMS is when the session's latest active message was written.
+	LastMessageAtMS int64
+}
+
+// SessionDetails returns a SessionDetail for every session ListSessions lists, keyed by id.
+func (s *Store) SessionDetails() (map[string]SessionDetail, error) {
+	out := map[string]SessionDetail{}
+	rows, err := s.db.Query(`SELECT id, ` + columns(s.sessionCols, "model_config", "git_branch") + ` FROM sessions WHERE ` + column(s.sessionCols, "", "archived", "0") + ` = 0`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		var modelConfig, gitBranch sql.NullString
+		if err := rows.Scan(&id, &modelConfig, &gitBranch); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		var config struct {
+			DelegateFrom string `json:"_delegate_from"`
+		}
+		_ = json.Unmarshal([]byte(modelConfig.String), &config)
+		out[id] = SessionDetail{Branch: strings.TrimSpace(gitBranch.String), DelegateFrom: strings.TrimSpace(config.DelegateFrom)}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	rows, err = s.db.Query(`
+SELECT session_id, max(timestamp),
+       (SELECT f.content FROM messages f
+        WHERE f.session_id = m.session_id AND ` + column(s.messageCols, "f", "active", "1") + ` = 1 AND f.role = 'user' AND trim(COALESCE(f.content, '')) != ''
+        ORDER BY f.id LIMIT 1)
+FROM messages m
+WHERE ` + column(s.messageCols, "m", "active", "1") + ` = 1
+GROUP BY session_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var last sql.NullFloat64
+		var prompt sql.NullString
+		if err := rows.Scan(&id, &last, &prompt); err != nil {
+			return nil, err
+		}
+		detail, ok := out[id]
+		if !ok {
+			continue
+		}
+		detail.LastMessageAtMS = secondsToMillis(last)
+		detail.FirstPrompt = strings.TrimSpace(prompt.String)
+		out[id] = detail
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) LastMessageID(sessionID string) (int64, error) {
+	var last sql.NullInt64
+	if err := s.db.QueryRow(`SELECT max(id) FROM messages WHERE session_id = ? AND `+column(s.messageCols, "", "active", "1")+` = 1`, sessionID).Scan(&last); err != nil {
+		return 0, err
+	}
+	return last.Int64, nil
+}
+
+// MapSession maps one session's new messages into endpoint events. It also returns the tool calls
+// that are still waiting for their result, because Hermes writes a call's arguments on the
+// assistant row and the result on a later one: without carrying them across sweeps, a result
+// collected after its call would be classified with no command or path.
+//
+// The pending calls are returned rather than written onto the cursor so the caller can persist them
+// only once every event in the batch is written. Recording them earlier would drop a call's
+// arguments when a later emit fails and the sweep retries the same messages.
+//
+// cursor is what earlier sweeps collected; a zero Cursor maps the whole session, session-total
+// usage included, as a first sync does.
+func MapSession(session Session, messages []Message, cursor *Cursor) ([]MappedEvent, map[string]json.RawMessage) {
+	return mapSession(session, messages, cursor, "")
+}
+
+// mapSession is MapSession with the event ids keyed by idHome, the canonical path of the Hermes
+// home the session was read from. An empty idHome derives the ids from the session alone, as every
+// sync did before homes could collide.
+func mapSession(session Session, messages []Message, cursor *Cursor, idHome string) ([]MappedEvent, map[string]json.RawMessage) {
+	m := &mapper{session: session, cursor: cursor, calls: map[string]toolCall{}, idHome: idHome}
+	for id, raw := range cursor.PendingCalls {
+		var call toolCall
+		if json.Unmarshal(raw, &call) == nil && call.ID != "" {
+			m.calls[id] = call
+		}
+	}
+	m.mapSession()
+	for _, message := range messages {
+		m.mapMessage(message)
+	}
+	m.mapUsage()
+	m.mapSessionEnd()
+	return m.out, encodePendingCalls(m.calls)
+}
+
+func encodePendingCalls(calls map[string]toolCall) map[string]json.RawMessage {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make(map[string]json.RawMessage, len(calls))
+	for id, call := range calls {
+		data, err := json.Marshal(call)
+		if err != nil {
+			continue
+		}
+		out[id] = data
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+type mapper struct {
+	session         Session
+	cursor          *Cursor
+	idHome          string
+	out             []MappedEvent
+	calls           map[string]toolCall
+	lastTimestampMS int64
+}
+
+type toolCall struct {
+	ID        string                 `json:"id"`
+	Name      string                 `json:"name"`
+	Arguments map[string]interface{} `json:"arguments,omitempty"`
+}
+
+func (m *mapper) mapSession() {
+	if m.cursor.Started {
+		return
+	}
+	ev := m.base(m.session.StartedAtMS, "session.started", "session", schema.SeverityInfo, "Hermes session started")
+	ev.Raw = map[string]interface{}{"hermes": map[string]interface{}{
+		"source":            m.session.Source,
+		"title":             m.session.Title,
+		"parent_session_id": m.session.ParentSessionID,
+	}}
+	m.append(0, "session.started", ev)
+}
+
+func (m *mapper) mapSessionEnd() {
+	if m.session.EndedAtMS == 0 || m.cursor.EndedAtMS == m.session.EndedAtMS {
+		return
+	}
+	ev := m.base(m.session.EndedAtMS, "session.ended", "session", schema.SeverityInfo, "Hermes session ended")
+	ev.Raw = map[string]interface{}{"hermes": map[string]interface{}{
+		"end_reason": m.session.EndReason,
+	}}
+	m.append(0, fmt.Sprintf("session.ended.%d", m.session.EndedAtMS), ev)
+}
+
+func (m *mapper) mapUsage() {
+	usage := &schema.GenAIUsageInfo{}
+	if delta := m.session.InputTokens - m.cursor.InputTokens; delta > 0 {
+		usage.InputTokens = &delta
+	}
+	if delta := m.session.OutputTokens - m.cursor.OutputTokens; delta > 0 {
+		usage.OutputTokens = &delta
+	}
+	if delta := m.session.CacheReadTokens - m.cursor.CacheReadTokens; delta > 0 {
+		usage.CacheRead = &schema.GenAIUsageCacheReadInfo{InputTokens: &delta}
+	}
+	if delta := m.session.CacheWriteTokens - m.cursor.CacheWriteTokens; delta > 0 {
+		usage.CacheCreation = &schema.GenAIUsageCacheCreationInfo{InputTokens: &delta}
+	}
+	if delta := m.session.ReasoningTokens - m.cursor.ReasoningTokens; delta > 0 {
+		usage.Reasoning = &schema.GenAIUsageReasoningInfo{OutputTokens: &delta}
+	}
+	cost := sessionCost(m.session)
+	if delta := cost - m.cursor.CostUSD; delta > 0 {
+		usage.CostUSD = &delta
+	}
+	if usage.InputTokens == nil && usage.OutputTokens == nil && usage.CacheRead == nil && usage.CacheCreation == nil && usage.Reasoning == nil && usage.CostUSD == nil {
+		return
+	}
+	ts := m.session.EndedAtMS
+	if ts == 0 {
+		ts = m.lastTimestampMS
+	}
+	if ts == 0 {
+		ts = m.session.StartedAtMS
+	}
+	if ts == 0 {
+		ts = time.Now().UnixMilli()
+	}
+	ev := m.base(ts, "token.usage", "metric", schema.SeverityInfo, "Hermes token usage")
+	ev.GenAI = m.withGenAI(ev.GenAI, func(genAI *schema.GenAIInfo) { genAI.Usage = usage })
+	ev.Raw = map[string]interface{}{"hermes": map[string]interface{}{
+		"token_source": "session_totals_delta",
+		"cost_status":  m.session.CostStatus,
+		"cost_source":  m.session.CostSource,
+	}}
+	m.append(0, fmt.Sprintf("token.usage.%d.%d.%d.%d.%d.%g",
+		m.session.InputTokens,
+		m.session.OutputTokens,
+		m.session.CacheReadTokens,
+		m.session.CacheWriteTokens,
+		m.session.ReasoningTokens,
+		cost,
+	), ev)
+}
+
+func (m *mapper) mapMessage(message Message) {
+	if message.TimestampMS > m.lastTimestampMS {
+		m.lastTimestampMS = message.TimestampMS
+	}
+	role := strings.ToLower(strings.TrimSpace(message.Role))
+	switch role {
+	case "user":
+		if text := strings.TrimSpace(message.Content); text != "" {
+			ev := m.base(message.TimestampMS, "prompt.submitted", "prompt", schema.SeverityInfo, "Hermes prompt submitted")
+			ev.Prompt = &schema.PromptInfo{Text: text}
+			ev.Content = asymptoteobserve.RetainedContent(text, asymptoteobserve.DefaultStringLimit)
+			m.append(message.ID, "prompt.submitted", ev)
+			if info, ok := asymptoteobserve.ParseHandoffMarker(text); ok {
+				link := m.base(message.TimestampMS, "session.handoff", "session", schema.SeverityInfo, "Session continued from a "+info.SourceHarness+" session")
+				link.Handoff = &info
+				m.append(message.ID, "prompt.submitted.handoff", link)
+			}
+		}
+	case "assistant":
+		for idx, text := range reasoningParts(message) {
+			ev := m.base(message.TimestampMS, "agent.reasoning", "session", schema.SeverityInfo, "Hermes agent reasoning")
+			ev.Content = asymptoteobserve.RetainedContent(text, asymptoteobserve.DefaultStringLimit)
+			ev.GenAI = m.withGenAI(ev.GenAI, func(genAI *schema.GenAIInfo) {
+				genAI.Output = &schema.GenAIOutputInfo{Messages: []map[string]interface{}{{"role": "assistant", "content": text, "type": "reasoning"}}}
+			})
+			ev.Raw = map[string]interface{}{"hermes": map[string]interface{}{"reasoning_part": idx}}
+			m.append(message.ID, fmt.Sprintf("reasoning.%d", idx), ev)
+		}
+		if text := strings.TrimSpace(message.Content); text != "" {
+			ev := m.base(message.TimestampMS, "agent.message", "agent", schema.SeverityInfo, "Hermes assistant message")
+			ev.Content = asymptoteobserve.RetainedContent(text, asymptoteobserve.DefaultStringLimit)
+			ev.GenAI = m.withGenAI(ev.GenAI, func(genAI *schema.GenAIInfo) {
+				genAI.Output = &schema.GenAIOutputInfo{Messages: []map[string]interface{}{{"role": "assistant", "content": text}}}
+			})
+			m.append(message.ID, "agent.message", ev)
+		}
+		for idx, call := range parseToolCalls(message.ToolCalls) {
+			m.calls[call.ID] = call
+			ev := m.toolEvent(message.TimestampMS, call, "tool.invoked", "tool", schema.SeverityInfo, "Hermes tool invoked")
+			m.append(message.ID, fmt.Sprintf("tool_call.%d", idx), ev)
+		}
+	case "tool":
+		call := m.calls[message.ToolCallID]
+		if call.ID == "" {
+			call = toolCall{ID: message.ToolCallID, Name: message.ToolName}
+		}
+		if call.Name == "" {
+			call.Name = message.ToolName
+		}
+		delete(m.calls, message.ToolCallID)
+		m.mapToolResult(message, call)
+	}
+}
+
+func (m *mapper) mapToolResult(message Message, call toolCall) {
+	result := decodeJSONObject(message.Content)
+	action, category, severity, msg := classifyTool(call.Name, call.Arguments, result)
+	ev := m.toolEvent(message.TimestampMS, call, action, category, severity, msg)
+	if output := firstString(result, "output", "stdout", "stderr", "result", "content"); output != "" {
+		ev.Content = asymptoteobserve.RetainedContent(output, asymptoteobserve.DefaultStringLimit)
+	}
+	switch action {
+	case "command.executed":
+		ev.Command = &schema.CommandInfo{Command: stringArg(call.Arguments, "command", "cmd")}
+		if output := firstString(result, "output", "stdout", "stderr", "result"); output != "" {
+			ev.Command.Output = output
+		}
+		if code, ok := intArg(result, "exit_code", "exitCode", "code"); ok {
+			ev.Command.ExitCode = &code
+			if code != 0 {
+				ev.Error = &schema.ErrorInfo{Type: "command_failed"}
+			}
+		}
+	case "file.read", "file.created", "file.modified":
+		path := stringArg(call.Arguments, "path", "file_path", "target_path")
+		ev.File = &schema.FileInfo{Path: path, Operation: fileOperationForAction(action)}
+		if path != "" {
+			ev.File.Language = strings.TrimPrefix(filepath.Ext(path), ".")
+		}
+		if diff := firstString(call.Arguments, "diff", "patch"); diff != "" {
+			ev.File.Diff = diff
+			ev.Content, ev.File.DiffHash, ev.File.DiffBytes = asymptoteobserve.RetainedDiff(diff, asymptoteobserve.DefaultStringLimit)
+		}
+	case "mcp.tool_invoked":
+		ev.MCP = &schema.MCPInfo{Tool: call.Name}
+	}
+	if errorText := firstString(result, "error"); errorText != "" && ev.Error == nil {
+		ev.Error = &schema.ErrorInfo{Type: "tool_error"}
+	}
+	ev.Raw = mergeRaw(ev.Raw, map[string]interface{}{"hermes": map[string]interface{}{
+		"tool_result": result,
+	}})
+	m.append(message.ID, "tool_result", ev)
+}
+
+func (m *mapper) base(timestampMS int64, action, category string, severity schema.Severity, message string) schema.Event {
+	ev := schema.NewEvent(schema.NewEventOptions{
+		Action:   action,
+		Category: category,
+		Severity: severity,
+		Message:  message,
+		Origin:   schema.OriginLocal,
+		Fidelity: schema.FidelityObserved,
+		Harness: schema.HarnessInfo{
+			Name:             Harness,
+			CollectionMethod: schema.CollectionMethodPoll,
+		},
+	})
+	if timestampMS > 0 {
+		ev.Timestamp = schema.FormatTimestamp(time.UnixMilli(timestampMS))
+	}
+	ev.Session = &schema.SessionInfo{ID: m.session.ID, WorkingDirectory: m.session.CWD}
+	if m.session.Model != "" {
+		ev.Model = asymptoteobserve.NormalizeModelName(m.session.Model)
+		ev.GenAI = m.withGenAI(ev.GenAI, func(genAI *schema.GenAIInfo) {
+			genAI.Request = &schema.GenAIRequestInfo{Model: ev.Model}
+		})
+	}
+	return ev
+}
+
+func (m *mapper) toolEvent(timestampMS int64, call toolCall, action, category string, severity schema.Severity, message string) schema.Event {
+	ev := m.base(timestampMS, action, category, severity, message)
+	ev.Tool = &schema.ToolInfo{Name: call.Name}
+	if command := stringArg(call.Arguments, "command", "cmd"); command != "" {
+		ev.Tool.Command = command
+	}
+	if path := stringArg(call.Arguments, "path", "file_path", "target_path"); path != "" {
+		ev.Tool.Path = path
+	}
+	ev.GenAI = m.withGenAI(ev.GenAI, func(genAI *schema.GenAIInfo) {
+		genAI.Operation = &schema.GenAIOperationInfo{Name: "execute_tool"}
+		genAI.Tool = &schema.GenAIToolInfo{
+			Name: call.Name,
+			Call: &schema.GenAIToolCallInfo{
+				ID:        call.ID,
+				Arguments: call.Arguments,
+			},
+		}
+	})
+	return ev
+}
+
+func (m *mapper) append(sourceMessageID int64, suffix string, ev schema.Event) {
+	dedupID := fmt.Sprintf("%s:%d:%s", m.session.ID, sourceMessageID, suffix)
+	if m.idHome != "" {
+		// The home ends at a newline, which Hermes session ids do not contain, so a keyed id never
+		// equals an unkeyed one.
+		dedupID = m.idHome + "\n" + dedupID
+	}
+	ev.Event.ID = hermesEventID(dedupID)
+	m.out = append(m.out, MappedEvent{SourceMessageID: sourceMessageID, Event: ev})
+}
+
+func (m *mapper) withGenAI(genAI *schema.GenAIInfo, edit func(*schema.GenAIInfo)) *schema.GenAIInfo {
+	if genAI == nil {
+		genAI = &schema.GenAIInfo{}
+	}
+	edit(genAI)
+	return genAI
+}
+
+func parseToolCalls(raw string) []toolCall {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var items []map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &items); err != nil {
+		return nil
+	}
+	out := make([]toolCall, 0, len(items))
+	for _, item := range items {
+		id := firstString(item, "id", "call_id")
+		fn := asMap(item["function"])
+		name := firstString(item, "name", "tool_name")
+		args := map[string]interface{}{}
+		if fn != nil {
+			name = firstNonEmpty(name, firstString(fn, "name"))
+			args = decodeArguments(fn["arguments"])
+		} else {
+			args = decodeArguments(item["arguments"])
+		}
+		if id == "" {
+			id = firstString(item, "tool_call_id")
+		}
+		out = append(out, toolCall{ID: id, Name: name, Arguments: args})
+	}
+	return out
+}
+
+func classifyTool(name string, args, result map[string]interface{}) (string, string, schema.Severity, string) {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if strings.Contains(lower, "__") || strings.HasPrefix(lower, "mcp_") {
+		return "mcp.tool_invoked", "mcp", schema.SeverityInfo, "Hermes MCP tool invoked"
+	}
+	failed := firstString(result, "error") != "" || boolArg(result, "error") || boolArg(result, "failed")
+	if lower == "terminal" || strings.Contains(lower, "shell") || strings.Contains(lower, "bash") || stringArg(args, "command", "cmd") != "" {
+		return "command.executed", "command", schema.SeverityInfo, "Hermes command executed"
+	}
+	if isFileReadTool(lower) {
+		return "file.read", "file", schema.SeverityInfo, "Hermes file read"
+	}
+	if isFileCreateTool(lower) {
+		return "file.created", "file", schema.SeverityInfo, "Hermes file created"
+	}
+	if isFileEditTool(lower) {
+		return "file.modified", "file", schema.SeverityInfo, "Hermes file modified"
+	}
+	if failed {
+		return "tool.failed", "tool", schema.SeverityHigh, "Hermes tool failed"
+	}
+	return "tool.completed", "tool", schema.SeverityInfo, "Hermes tool completed"
+}
+
+func isFileReadTool(lower string) bool {
+	return strings.Contains(lower, "read") || strings.Contains(lower, "grep") || strings.Contains(lower, "search") || strings.Contains(lower, "list") || strings.Contains(lower, "find")
+}
+
+func isFileCreateTool(lower string) bool {
+	return strings.Contains(lower, "create") || strings.Contains(lower, "write")
+}
+
+func isFileEditTool(lower string) bool {
+	return strings.Contains(lower, "edit") || strings.Contains(lower, "patch") || strings.Contains(lower, "replace")
+}
+
+func fileOperationForAction(action string) string {
+	switch action {
+	case "file.read":
+		return "read"
+	case "file.created":
+		return "create"
+	case "file.modified":
+		return "modify"
+	default:
+		return ""
+	}
+}
+
+func reasoningParts(message Message) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, text := range []string{message.Reasoning, message.ReasoningContent, message.ReasoningDetails} {
+		text = strings.TrimSpace(text)
+		if text == "" || seen[text] {
+			continue
+		}
+		seen[text] = true
+		out = append(out, text)
+	}
+	return out
+}
+
+func decodeArguments(value interface{}) map[string]interface{} {
+	switch typed := value.(type) {
+	case string:
+		return decodeJSONObject(typed)
+	case map[string]interface{}:
+		return typed
+	default:
+		return map[string]interface{}{}
+	}
+}
+
+func decodeJSONObject(raw string) map[string]interface{} {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return map[string]interface{}{}
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return map[string]interface{}{"result": raw}
+	}
+	return out
+}
+
+func asMap(value interface{}) map[string]interface{} {
+	if m, ok := value.(map[string]interface{}); ok {
+		return m
+	}
+	return nil
+}
+
+func stringArg(m map[string]interface{}, keys ...string) string {
+	return firstString(m, keys...)
+}
+
+func firstString(m map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		switch v := m[key].(type) {
+		case string:
+			if strings.TrimSpace(v) != "" {
+				return v
+			}
+		case fmt.Stringer:
+			if strings.TrimSpace(v.String()) != "" {
+				return v.String()
+			}
+		case float64:
+			return strconv.FormatFloat(v, 'f', -1, 64)
+		case int:
+			return strconv.Itoa(v)
+		case int64:
+			return strconv.FormatInt(v, 10)
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func intArg(m map[string]interface{}, keys ...string) (int, bool) {
+	for _, key := range keys {
+		switch v := m[key].(type) {
+		case float64:
+			return int(v), true
+		case int:
+			return v, true
+		case int64:
+			return int(v), true
+		case string:
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+				return n, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func boolArg(m map[string]interface{}, keys ...string) bool {
+	for _, key := range keys {
+		v, ok := m[key].(bool)
+		if ok && v {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeRaw(raw map[string]interface{}, next map[string]interface{}) map[string]interface{} {
+	if raw == nil {
+		raw = map[string]interface{}{}
+	}
+	for k, v := range next {
+		raw[k] = v
+	}
+	return raw
+}
+
+func secondsToMillis(value sql.NullFloat64) int64 {
+	if !value.Valid || value.Float64 <= 0 {
+		return 0
+	}
+	return int64(value.Float64 * 1000)
+}
+
+func sessionCost(session Session) float64 {
+	if session.ActualCostUSD > 0 {
+		return session.ActualCostUSD
+	}
+	return session.EstimatedCostUSD
+}
+
+var hermesIDNamespace = [16]byte{
+	0x58, 0x24, 0x3d, 0x29, 0x5e, 0xa1, 0x4b, 0xbe,
+	0x85, 0xa7, 0x49, 0x11, 0xa7, 0x18, 0xdb, 0x0c,
+}
+
+func hermesEventID(dedupID string) string {
+	digest := sha1.New()
+	digest.Write(hermesIDNamespace[:])
+	io.WriteString(digest, dedupID)
+	var id [16]byte
+	copy(id[:], digest.Sum(nil))
+	id[6] = (id[6] & 0x0f) | 0x50
+	id[8] = (id[8] & 0x3f) | 0x80
+	out := make([]byte, 32)
+	hex.Encode(out, id[:])
+	return fmt.Sprintf("%s-%s-%s-%s-%s", out[0:8], out[8:12], out[12:16], out[16:20], out[20:32])
+}
