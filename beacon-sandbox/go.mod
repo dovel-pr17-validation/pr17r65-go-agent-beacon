@@ -6,15 +6,14 @@ toolchain go1.27.3
 
 require (
 	github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve v0.0.0
-	github.com/modal-labs/modal-client/go v0.9.0
+	github.com/modal-labs/modal-client/go v0.11.2
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/aristanetworks/gomap v0.0.0-20230726210543-f4e41046dced // indirect
-	github.com/djherbis/buffer v1.2.0 // indirect
-	github.com/djherbis/nio/v3 v3.0.1 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
+	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/kisielk/og-rek v1.3.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
